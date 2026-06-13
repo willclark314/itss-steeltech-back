@@ -1,0 +1,39 @@
+{
+  "design": {
+    "name": "设计组项目目录",
+    "description": "适用于设计组归档项目，包含方案、施工图与联系单等子目录",
+    "directories": [
+      "01 原图",
+      "02 方案",
+      "03 施工图",
+      "04 联系单",
+      "05 校对记录",
+      "06 归档"
+    ],
+    "files": [],
+    "directoryReadme": "目录说明.txt",
+    "packReadme": "打包说明.txt",
+    "packReadmePaths": [
+      ".",
+      "06 归档"
+    ]
+  },
+  "detail": {
+    "name": "细化组项目目录",
+    "description": "适用于细化/加工单归档项目，从 path_template 复制标准目录结构与样板文件",
+    "sourceDir": "path_template",
+    "sourceRoot": "（空样板！勿剪切）工程编号#项目名称【待安排@@】(需排瓦&不排瓦)(GJGJSK-2026.3.10版)",
+    "unwrapMainProjectDir": true,
+    "nameTokens": {
+      "工程编号": "{projectNoDigits}",
+      "项目名称": "{projectName}",
+      "工程名称": "{projectName}"
+    },
+    "directoryReadme": "目录说明.txt",
+    "packReadme": "打包说明.txt",
+    "packReadmePaths": [
+      ".",
+      "3-加工图及清单/8-清单"
+    ]
+  }
+}

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE TeklaStructuresModels>
+<TeklaStructuresModels>
+<Model>
+<Name>
+Tekla空模型【内含各厚度花纹板、不锈钢304材质】-2026.3.5版
+</Name>
+<Designer>
+ 
+</Designer>
+<Description>
+ 
+</Description>
+<Version>
+19.0 Service Release 7
+</Version>
+<Language>
+chs
+</Language>
+<Template>
+
+</Template>
+<Environment>
+china
+</Environment>
+<IsTemplate>
+FALSE
+</IsTemplate>
+<XS_PROJECT>
+
+</XS_PROJECT>
+<XS_FIRM>
+
+</XS_FIRM>
+<XS_SYSTEM>
+D:\Program Files\Tekla Structures\19.0\\environments\china\system\;D:\Program Files\Tekla Structures\19.0\\environments\common\system\;D:\Program Files\Tekla Structures\19.0\\environments\common\system\ConstructionManagement\;D:\Program Files\Tekla Struct
+</XS_SYSTEM>
+</Model>
+</TeklaStructuresModels>
+

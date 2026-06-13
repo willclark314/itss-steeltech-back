@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE TeklaStructuresModels>
+<TeklaStructuresModels>
+<Model>
+<Name>
+A25433-1#青城铬铁-熔炼主厂房
+</Name>
+<Designer>
+常东港
+</Designer>
+<Description>
+XXXXX
+</Description>
+<Version>
+19.0 Service Release 7
+</Version>
+<Environment>
+china
+</Environment>
+<Language>
+chs
+</Language>
+</Model>
+<Model>
+<Name>
+Tekla空模型【内含各厚度花纹板、不锈钢304材质】-2026.3.5版
+</Name>
+<Designer>
+ 
+</Designer>
+<Description>
+ 
+</Description>
+<Version>
+19.0 Service Release 7
+</Version>
+<Environment>
+china
+</Environment>
+<Language>
+chs
+</Language>
+</Model>
+</TeklaStructuresModels>
+
