@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import base64
-import os
-import re
+import hashlib
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import text
 
-from app.extensions import db
+from app.config import Config
+from steeltech_db.extensions import db
 from app.utils.pagination import ListPageQuery, compute_paginated_window
 
 CONTACT_LIST_ORDER = "COALESCE(cf.root_id, cf.id) DESC, cf.sort_order ASC, cf.id ASC"
-CONTACT_PDF_ROOT = Path(__file__).resolve().parents[2] / "datas" / "files" / "contact-pdfs"
+CONTACT_PDF_ROOT = Path(Config.CONTACT_PDF_STORAGE_ROOT)
 
 
 def _row_to_dict(row) -> dict:
@@ -43,16 +43,20 @@ def _generate_cancellation_id() -> str:
     return f"canc_{int(datetime.now().timestamp() * 1000)}_{uuid.uuid4().hex[:6]}"
 
 
-def _save_pdf_file(contact_form_id: str, file_name: str, content: str) -> dict:
-    safe_name = re.sub(r"[^\w.\-()\u4e00-\u9fff]", "_", os.path.basename(file_name)) or "file.pdf"
-    target_dir = CONTACT_PDF_ROOT / contact_form_id
+def _save_pdf_file(contact_form_id: str, _file_name: str, content: str) -> dict:
+    content_bytes = base64.b64decode(content)
+    file_md5 = hashlib.md5(content_bytes).hexdigest()
+    # 日期目录：yyyyMMdd（例如 20260611），不使用斜杠
+    dated_path = datetime.now().strftime("%Y%m%d")
+    target_dir = CONTACT_PDF_ROOT / dated_path
     target_dir.mkdir(parents=True, exist_ok=True)
-    file_path = target_dir / safe_name
-    file_path.write_bytes(base64.b64decode(content))
-    relative_path = f"datas/files/contact-pdfs/{contact_form_id}/{safe_name}"
+    file_path = target_dir / f"{file_md5}.pdf"
+    file_path.write_bytes(content_bytes)
+    relative_path = f"{dated_path}/{file_md5}.pdf"
     return {
-        "file_name": safe_name,
+        "file_name": f"{file_md5}.pdf",
         "file_path": relative_path,
+        "file_md5": file_md5,
         "file_size": file_path.stat().st_size,
     }
 
@@ -107,7 +111,7 @@ def get_pdfs_map(contact_form_ids: list[str]) -> tuple[dict[str, dict], dict[str
         item = {
             "id": row.id,
             "name": row.file_name,
-            "url": f"/{(row.file_path or '').replace(chr(92), '/')}",
+            "url": f"/api/contact-pdfs/{(row.file_path or '').replace(chr(92), '/')}",
         }
         if row.attachment_type == "primary":
             primary_map[row.contact_form_id] = item
@@ -311,9 +315,9 @@ def _insert_pdf_records(
             text(
                 """
                 INSERT INTO contact_form_pdfs (
-                  id, contact_form_id, file_name, file_path, file_size, mime_type,
+                  id, contact_form_id, file_name, file_path, file_md5, file_size, mime_type,
                   attachment_type, sort_order, created_at
-                ) VALUES (:id, :contact_form_id, :file_name, :file_path, :file_size, :mime_type, 'primary', 0, :created_at)
+                ) VALUES (:id, :contact_form_id, :file_name, :file_path, :file_md5, :file_size, :mime_type, 'primary', 0, :created_at)
                 """
             ),
             {
@@ -321,6 +325,7 @@ def _insert_pdf_records(
                 "contact_form_id": contact_form_id,
                 "file_name": saved["file_name"],
                 "file_path": saved["file_path"],
+                "file_md5": saved["file_md5"],
                 "file_size": saved["file_size"],
                 "mime_type": "application/pdf",
                 "created_at": created_at,
@@ -347,9 +352,9 @@ def _insert_pdf_records(
             text(
                 """
                 INSERT INTO contact_form_pdfs (
-                  id, contact_form_id, file_name, file_path, file_size, mime_type,
+                  id, contact_form_id, file_name, file_path, file_md5, file_size, mime_type,
                   attachment_type, sort_order, created_at
-                ) VALUES (:id, :contact_form_id, :file_name, :file_path, :file_size, :mime_type, 'supplement', :sort_order, :created_at)
+                ) VALUES (:id, :contact_form_id, :file_name, :file_path, :file_md5, :file_size, :mime_type, 'supplement', :sort_order, :created_at)
                 """
             ),
             {
@@ -357,6 +362,7 @@ def _insert_pdf_records(
                 "contact_form_id": contact_form_id,
                 "file_name": saved["file_name"],
                 "file_path": saved["file_path"],
+                "file_md5": saved["file_md5"],
                 "file_size": saved["file_size"],
                 "mime_type": "application/pdf",
                 "sort_order": max_sort + index + 1,
@@ -683,9 +689,4 @@ def delete_contact(contact_id: str) -> bool:
         return False
     db.session.execute(text("DELETE FROM contact_forms WHERE id = :id"), {"id": contact_id})
     db.session.commit()
-    pdf_dir = CONTACT_PDF_ROOT / contact_id
-    if pdf_dir.exists():
-        for child in pdf_dir.iterdir():
-            child.unlink(missing_ok=True)
-        pdf_dir.rmdir()
     return True

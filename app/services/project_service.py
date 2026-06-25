@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
-from app.extensions import db
-from app.models import ContactFormProject, Personnel, Project, ProjectNature
+from steeltech_db.extensions import db
+from steeltech_db.models import ContactFormProject, Personnel, Project, ProjectNature
 from app.utils.pagination import ListPageQuery, compute_paginated_window
 from app.utils.paths import normalize_relative_path
 
@@ -471,7 +471,10 @@ def update_project(project_no: str, payload: dict) -> tuple[dict | None, str | N
         return None, "项目不存在", 404
 
     existing = _row_to_dict(row)
-    name = (payload.get("name") or "").strip()
+    if "name" in payload:
+        name = (payload.get("name") or "").strip()
+    else:
+        name = (existing.get("name") or "").strip()
     if not name:
         return None, "项目名称不能为空", 400
 

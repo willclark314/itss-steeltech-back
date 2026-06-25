@@ -13,7 +13,7 @@ def test_login_success(client):
 def test_login_empty_credentials(client):
     resp = client.post("/api/auth/login", json={"username": "", "password": ""})
     assert resp.status_code == 400
-    assert resp.get_json()["message"] == "用户名和密码不能为空"
+    assert resp.get_json()["message"] == "请输入账号和密码"
 
 
 def test_login_wrong_password(client):
@@ -22,7 +22,7 @@ def test_login_wrong_password(client):
         json={"username": "admin", "password": "wrong"},
     )
     assert resp.status_code == 401
-    assert resp.get_json()["message"] == "用户名或密码错误"
+    assert resp.get_json()["message"] == "工号或密码错误"
 
 
 def test_login_user_not_found(client):
@@ -31,4 +31,4 @@ def test_login_user_not_found(client):
         json={"username": "nobody", "password": "123456"},
     )
     assert resp.status_code == 401
-    assert resp.get_json()["message"] == "用户名或密码错误"
+    assert resp.get_json()["message"] == "工号或密码错误"

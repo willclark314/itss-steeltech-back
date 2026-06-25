@@ -1,0 +1,12 @@
+{
+    "terminal.integrated.defaultProfile.windows": "PowerShell",
+    "terminal.integrated.profiles.windows": {
+        "PowerShell": {
+            "source": "PowerShell",
+            "args": ["-NoExit", "-Command", "chcp 65001 > $null"]
+        }
+    },
+    "code-runner.executorMap": {
+        "powershell": "chcp 65001 > $null; powershell -ExecutionPolicy ByPass -File $fileName"
+    }
+}

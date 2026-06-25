@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from app.extensions import db
-from app.models import Personnel
+from steeltech_db.extensions import db
+from steeltech_db.models import Personnel
 
 DEFAULT_WORKSHOP = "钢结构技术科"
 

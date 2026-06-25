@@ -3,8 +3,8 @@ from sqlalchemy.pool import StaticPool
 
 from app import create_app
 from app.config import Config
-from app.extensions import db
-from app.models.user import User
+from steeltech_db.extensions import db
+from steeltech_db.models.user import User
 
 
 class TestConfig(Config):

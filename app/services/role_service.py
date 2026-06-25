@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
-from app.extensions import db
-from app.models import Permission, Personnel, Role, RolePermission, RolePersonnel
+from steeltech_db.extensions import db
+from steeltech_db.models import Permission, Personnel, Role, RolePermission, RolePersonnel
 
 
-from app.utils.permission_catalog import sort_permissions
+from steeltech_db.permission_catalog import sort_permissions
 
 
 def get_role_permissions(role_id: str) -> list[dict]:
@@ -23,7 +23,7 @@ def get_role_personnel(role_id: str) -> list[dict]:
     rows = (
         db.session.query(Personnel)
         .join(RolePersonnel, RolePersonnel.personnel_id == Personnel.id)
-        .filter(RolePersonnel.role_id == role_id)
+        .filter(RolePersonnel.role_id == role_id, Personnel.status == "active")
         .order_by(Personnel.team, Personnel.name)
         .all()
     )
@@ -93,8 +93,11 @@ def normalize_permission_ids(ids: list[str] | None) -> tuple[list[str] | None, s
 def normalize_assigned_personnel_ids(ids: list[str] | None) -> tuple[list[str] | None, str | None]:
     unique = list(dict.fromkeys(item.strip() for item in (ids or []) if item and item.strip()))
     for personnel_id in unique:
-        if Personnel.query.get(personnel_id) is None:
+        person = Personnel.query.get(personnel_id)
+        if person is None:
             return None, "关联人员不存在"
+        if person.status != "active":
+            return None, f"人员「{person.name}」已离职，不能关联到角色"
     return unique, None
 
 

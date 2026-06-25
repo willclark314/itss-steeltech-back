@@ -193,6 +193,7 @@ CREATE TABLE IF NOT EXISTS contact_form_pdfs (
   contact_form_id TEXT NOT NULL,
   file_name       TEXT NOT NULL,
   file_path       TEXT NOT NULL,
+  file_md5        TEXT,
   file_size       INTEGER,
   mime_type       TEXT NOT NULL DEFAULT 'application/pdf',
   attachment_type TEXT NOT NULL DEFAULT 'supplement',
@@ -219,3 +220,29 @@ CREATE TABLE IF NOT EXISTS contact_form_project_cancellations (
 
 CREATE INDEX IF NOT EXISTS idx_cfpc_cancel ON contact_form_project_cancellations (cancel_contact_id);
 CREATE INDEX IF NOT EXISTS idx_cfpc_target ON contact_form_project_cancellations (target_contact_id);
+
+-- 月休计划
+CREATE TABLE IF NOT EXISTS monthly_rest (
+  id            TEXT PRIMARY KEY,
+  personnel_id  TEXT NOT NULL,
+  year          INTEGER NOT NULL,
+  month         INTEGER NOT NULL,
+  rest_days     TEXT NOT NULL DEFAULT '[]',
+  created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+  updated_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+  FOREIGN KEY (personnel_id) REFERENCES personnel (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_monthly_rest_personnel ON monthly_rest (personnel_id);
+CREATE INDEX IF NOT EXISTS idx_monthly_rest_year_month ON monthly_rest (year, month);
+
+-- 月休计划锁定（按年月，管理员定稿后员工不可再修改）
+CREATE TABLE IF NOT EXISTS monthly_rest_lock (
+  year        INTEGER NOT NULL,
+  month       INTEGER NOT NULL,
+  locked_by   TEXT,
+  locked_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+  PRIMARY KEY (year, month)
+);
+
+CREATE INDEX IF NOT EXISTS idx_monthly_rest_lock_year_month ON monthly_rest_lock (year, month);

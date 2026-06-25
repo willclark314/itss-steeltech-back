@@ -1,40 +1,20 @@
 import os
 from pathlib import Path
 
+from steeltech_db.config import BaseConfig
 
-class Config:
+
+class Config(BaseConfig):
+    """后端应用配置 —— 继承数据库基础配置，添加应用特定设置。
+
+    SQLite 数据库文件默认位于 itss-steeltech-db/datas/steeltech.db，
+    可通过 SQLITE_DATABASE_PATH 环境变量覆盖。
+    """
+
     BASE_DIR = Path(__file__).resolve().parent.parent
 
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", SECRET_KEY)
-
-    DATABASE_BACKEND = os.getenv("DATABASE_BACKEND", "sqlite").lower()
-
-    SQLITE_DATABASE_PATH = Path(
-        os.getenv(
-            "SQLITE_DATABASE_PATH",
-            str(BASE_DIR / "instance" / "steeltech.db"),
-        )
-    )
-
-    MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
-    MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
-    MYSQL_USER = os.getenv("MYSQL_USER", "root")
-    MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
-    MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "itss_steeltech")
-
-    if DATABASE_BACKEND == "mysql":
-        SQLALCHEMY_DATABASE_URI = (
-            f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}"
-            f"@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}?charset=utf8mb4"
-        )
-    else:
-        SQLITE_DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SQLALCHEMY_DATABASE_URI = (
-            "sqlite:///" + SQLITE_DATABASE_PATH.as_posix()
-        )
-
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
 
     CORS_ORIGINS = [
         origin.strip()
@@ -45,3 +25,9 @@ class Config:
     ]
 
     DEFAULT_LOGIN_PASSWORD = os.getenv("DEFAULT_LOGIN_PASSWORD", "123456")
+    CONTACT_PDF_STORAGE_ROOT = Path(
+        os.getenv(
+            "CONTACT_PDF_STORAGE_ROOT",
+            str(BASE_DIR / "datas" / "files" / "contact-pdfs"),
+        )
+    )

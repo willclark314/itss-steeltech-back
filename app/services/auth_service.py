@@ -3,9 +3,9 @@ from __future__ import annotations
 from flask import current_app
 from flask_jwt_extended import create_access_token, get_jwt, get_jwt_identity
 
-from app.extensions import db
-from app.models import AccountPassword, Personnel
-from app.seed import DEV_USER_PROFILES
+from steeltech_db.extensions import db
+from steeltech_db.models import AccountPassword, Personnel, Role, RolePersonnel
+from steeltech_db.seed import DEV_USER_PROFILES
 
 DEV_USERNAMES = frozenset({"admin", "user"})
 
@@ -45,6 +45,7 @@ def build_login_user(
     profile: dict,
     *,
     personnel_id: str | None = None,
+    roles: list[str] | None = None,
 ) -> dict:
     return {
         "username": account,
@@ -53,6 +54,7 @@ def build_login_user(
         "personnelId": personnel_id or profile.get("id", ""),
         "loginType": login_type,
         "profile": profile,
+        "roles": roles or [],
     }
 
 
@@ -87,6 +89,17 @@ def get_dev_user_profile(account: str) -> dict | None:
     }
 
 
+def get_personnel_role_codes(personnel_id: str) -> list[str]:
+    """获取人员拥有的角色编码列表"""
+    rows = (
+        db.session.query(Role.code)
+        .join(RolePersonnel, Role.id == RolePersonnel.role_id)
+        .filter(RolePersonnel.personnel_id == personnel_id, Role.status == "active")
+        .all()
+    )
+    return [row.code for row in rows]
+
+
 def login(username: str, password: str) -> tuple[dict | None, str | None, int]:
     account = username.strip()
     if not account or not password:
@@ -102,7 +115,8 @@ def login(username: str, password: str) -> tuple[dict | None, str | None, int]:
             identity=account,
             additional_claims={"login_type": "dev", "personnel_id": profile["id"]},
         )
-        user = build_login_user(account, "dev", profile)
+        dev_roles = ["admin"] if account == "admin" else ["detailer"]
+        user = build_login_user(account, "dev", profile, roles=dev_roles)
         return {"token": token, "user": user}, None, 200
 
     person = find_personnel_by_employee_no(account)
@@ -112,11 +126,12 @@ def login(username: str, password: str) -> tuple[dict | None, str | None, int]:
         return None, "该人员账号不可用", 403
 
     profile = person.to_dict()
+    roles = get_personnel_role_codes(person.id)
     token = create_access_token(
         identity=account,
         additional_claims={"login_type": "personnel", "personnel_id": person.id},
     )
-    user = build_login_user(account, "personnel", profile, personnel_id=person.id)
+    user = build_login_user(account, "personnel", profile, personnel_id=person.id, roles=roles)
     return {"token": token, "user": user}, None, 200
 
 
@@ -152,7 +167,8 @@ def get_current_user() -> tuple[dict | None, str | None, int]:
         profile = get_dev_user_profile(str(account))
         if profile is None:
             return None, "开发账号配置缺失", 500
-        return {"user": build_login_user(str(account), "dev", profile)}, None, 200
+        dev_roles = ["admin"] if str(account) == "admin" else ["detailer"]
+        return {"user": build_login_user(str(account), "dev", profile, roles=dev_roles)}, None, 200
 
     personnel_id = claims.get("personnel_id")
     person = find_personnel_by_id(str(personnel_id)) if personnel_id else None
@@ -162,6 +178,7 @@ def get_current_user() -> tuple[dict | None, str | None, int]:
         return None, "未找到人员信息", 404
 
     profile = person.to_dict()
+    roles = get_personnel_role_codes(person.id)
     return {
-        "user": build_login_user(str(account), "personnel", profile, personnel_id=person.id),
+        "user": build_login_user(str(account), "personnel", profile, personnel_id=person.id, roles=roles),
     }, None, 200

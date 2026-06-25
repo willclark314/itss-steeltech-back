@@ -4,15 +4,17 @@ from dotenv import load_dotenv
 from flask import Flask, send_from_directory
 
 from app.config import Config
-from app.extensions import cors, db, jwt, migrate
+from app.extensions import cors, jwt
 from app.routes.auth import auth_bp
 from app.routes.contacts import contacts_bp
+from app.routes.monthly_rest import monthly_rest_bp
 from app.routes.permissions import permissions_bp
 from app.routes.personnel import personnel_bp
 from app.routes.projects import projects_bp
 from app.routes.roles import roles_bp
 from app.routes.system import system_bp
-from app.seed import bootstrap_sqlite_file, ensure_schema, seed_if_empty
+from steeltech_db.extensions import db, migrate
+from steeltech_db.seed import bootstrap_sqlite_file, ensure_schema, seed_if_empty
 
 
 def create_app(config_class: type[Config] = Config) -> Flask:
@@ -39,6 +41,7 @@ def create_app(config_class: type[Config] = Config) -> Flask:
     app.register_blueprint(roles_bp, url_prefix="/api/roles")
     app.register_blueprint(projects_bp, url_prefix="/api/projects")
     app.register_blueprint(contacts_bp, url_prefix="/api/contacts")
+    app.register_blueprint(monthly_rest_bp, url_prefix="/api/monthly-rest")
     app.register_blueprint(system_bp, url_prefix="/api/system")
 
     @app.get("/api/health")
@@ -51,8 +54,14 @@ def create_app(config_class: type[Config] = Config) -> Flask:
     def serve_datas(file_path: str):
         return send_from_directory(datas_root, file_path)
 
+    contact_pdf_root = Path(app.config["CONTACT_PDF_STORAGE_ROOT"])
+
+    @app.get("/api/contact-pdfs/<path:file_path>")
+    def serve_contact_pdfs(file_path: str):
+        return send_from_directory(contact_pdf_root, file_path)
+
     with app.app_context():
-        ensure_schema()
+        ensure_schema(app)
         seed_if_empty(app)
 
     return app

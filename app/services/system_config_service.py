@@ -2,81 +2,20 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
 from datetime import datetime
 
-from app.extensions import db
-from app.models import SystemSetting
-
-DEFAULT_SERVER_IP = "10.10.1.175"
-SETTINGS_KEY = "local_work_path"
-
-
-DEFAULT_PATH_PATTERNS = {
-    "design": "e\\itss\\{year}\\{projectNoDigits}#{projectName}",
-    "detail": "f\\itss\\{year}\\{projectNoDigits}#{projectName}",
-}
-
-
-@dataclass
-class LocalWorkPathConfig:
-    ip: str = DEFAULT_SERVER_IP
-    ips: list[str] | None = None
-    drive: str = "F"
-    path_patterns: dict[str, str] | None = None
-
-    def to_dict(self) -> dict:
-        ips = self.ips if self.ips is not None else [self.ip]
-        patterns = self.path_patterns or DEFAULT_PATH_PATTERNS
-        return {
-            "ip": self.ip,
-            "ips": ips,
-            "drive": self.drive,
-            "pathPatterns": {
-                "design": str(patterns.get("design", DEFAULT_PATH_PATTERNS["design"])),
-                "detail": str(patterns.get("detail", DEFAULT_PATH_PATTERNS["detail"])),
-            },
-        }
-
-
-DEFAULT_LOCAL_WORK_PATH = LocalWorkPathConfig(
-    ip=DEFAULT_SERVER_IP,
-    ips=[DEFAULT_SERVER_IP],
-    drive="F",
+from steeltech_db.defaults import (
+    DEFAULT_LOCAL_WORK_PATH,
+    DEFAULT_PATH_PATTERNS,
+    DEFAULT_SERVER_IP,
+    SETTINGS_KEY,
+    LocalWorkPathConfig,
+    normalize_drive,
+    normalize_ip_list,
+    normalize_path_patterns,
 )
-
-
-def normalize_drive(drive: str) -> str:
-    return drive.replace(":", "").strip().upper()
-
-
-def normalize_ip_list(ips: list | None, fallback_ip: str = DEFAULT_SERVER_IP) -> list[str]:
-    raw_list = ips if ips else [fallback_ip]
-    seen: set[str] = set()
-    result: list[str] = []
-
-    for raw in raw_list:
-        ip = str(raw).strip()
-        if not ip or not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip) or ip in seen:
-            continue
-        seen.add(ip)
-        result.append(ip)
-
-    if fallback_ip not in result:
-        result.insert(0, fallback_ip)
-    if not result:
-        result.append(fallback_ip)
-    return result
-
-
-def normalize_path_patterns(patterns: dict | None) -> dict[str, str]:
-    payload = patterns if isinstance(patterns, dict) else {}
-    return {
-        "design": str(payload.get("design", DEFAULT_PATH_PATTERNS["design"])).strip()
-        or DEFAULT_PATH_PATTERNS["design"],
-        "detail": str(payload.get("detail", DEFAULT_PATH_PATTERNS["detail"])).strip()
-        or DEFAULT_PATH_PATTERNS["detail"],
-    }
+from steeltech_db.extensions import db
+from steeltech_db.models import SystemSetting
 
 
 def normalize_local_work_path_config(config: dict | LocalWorkPathConfig | None) -> LocalWorkPathConfig:

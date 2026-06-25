@@ -7,8 +7,9 @@ from datetime import datetime
 from pathlib import Path
 
 from app.config import Config
-from app.services.system_config_service import get_local_work_path_config, normalize_drive
+from app.services.system_config_service import get_local_work_path_config
 from app.utils.paths import build_full_path_with_ip, normalize_relative_path
+from steeltech_db.defaults import normalize_drive
 
 TEMPLATE_FILE = Config.BASE_DIR / "datas" / "project_folder_templates.json"
 FILES_DIR = Config.BASE_DIR / "datas" / "files"

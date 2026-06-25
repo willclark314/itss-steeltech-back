@@ -1,6 +1,7 @@
 # 启动 Flask 后端（自动选择 Python：venv > 本机 Python）
 param(
-    [switch]$Init
+    [switch]$Init,
+    [switch]$Reset
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,18 +82,26 @@ $env:no_proxy = "*"
 Write-Host "Python: $python"
 Write-Host "工作目录: $Root"
 
-$dbPath = Join-Path $Root "instance\steeltech.db"
-if ($Init -or -not (Test-Path $dbPath)) {
-    if (-not (Test-Path $dbPath)) {
-        Write-Host "未找到数据库，正在初始化 instance\steeltech.db ..."
+# 从 Config 获取实际数据库路径（尊重 SQLITE_DATABASE_PATH 环境变量）
+$dbPath = (& $python -c "from dotenv import load_dotenv; load_dotenv(); from steeltech_db.config import BaseConfig; print(BaseConfig.SQLITE_DATABASE_PATH)").Trim()
+Write-Host "数据库路径: $dbPath"
+
+# -Init 或 -Reset：删除现有数据库文件，由 create_app() 重建
+if ($Init -or $Reset) {
+    if (Test-Path $dbPath) {
+        Write-Host "删除现有数据库: $dbPath"
+        Remove-Item $dbPath -Force
     } else {
-        Write-Host "正在重新初始化数据库 ..."
+        Write-Host "数据库文件不存在，将新建: $dbPath"
     }
-    & $python (Join-Path $Root "init_db.py")
 }
 
 Write-Host "启动后端: http://localhost:5000"
 Write-Host "健康检查: http://localhost:5000/api/health"
 Write-Host ""
 
+# run.py → create_app() 会自动完成:
+#   1. bootstrap_sqlite_file  – 创建数据库文件 + 执行 schema.sql
+#   2. ensure_schema         – db.create_all() + 迁移旧字段 + 同步权限
+#   3. seed_if_empty         – 填充种子数据（仅首次）
 & $python (Join-Path $Root "run.py")

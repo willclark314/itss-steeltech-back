@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import re
 
-from app.services.system_config_service import get_local_work_path_config, normalize_drive
+from app.services.system_config_service import get_local_work_path_config
+from steeltech_db.defaults import normalize_drive
 
 
 def normalize_relative_path(value: str) -> str:

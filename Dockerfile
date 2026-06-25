@@ -10,6 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 COPY requirements.txt .
+COPY ../itss-steeltech-db /itss-steeltech-db
 RUN pip install -r requirements.txt gunicorn \
     -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST}
 
