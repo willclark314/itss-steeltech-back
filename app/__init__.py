@@ -7,6 +7,7 @@ from app.config import Config
 from app.extensions import cors, jwt
 from app.routes.auth import auth_bp
 from app.routes.contacts import contacts_bp
+from app.routes.leave import leave_bp
 from app.routes.monthly_rest import monthly_rest_bp
 from app.routes.permissions import permissions_bp
 from app.routes.personnel import personnel_bp
@@ -42,6 +43,7 @@ def create_app(config_class: type[Config] = Config) -> Flask:
     app.register_blueprint(projects_bp, url_prefix="/api/projects")
     app.register_blueprint(contacts_bp, url_prefix="/api/contacts")
     app.register_blueprint(monthly_rest_bp, url_prefix="/api/monthly-rest")
+    app.register_blueprint(leave_bp, url_prefix="/api/leave")
     app.register_blueprint(system_bp, url_prefix="/api/system")
 
     @app.get("/api/health")

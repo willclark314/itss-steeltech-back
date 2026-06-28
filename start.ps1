@@ -1,4 +1,4 @@
-# 启动 Flask 后端（自动选择 Python：venv > 本机 Python）
+﻿# 启动 Flask 后端（自动选择 Python：venv > 本机 Python）
 param(
     [switch]$Init,
     [switch]$Reset

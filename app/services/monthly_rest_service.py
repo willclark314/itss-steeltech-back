@@ -14,6 +14,7 @@ from openpyxl.utils import get_column_letter
 
 from steeltech_db.extensions import db
 from steeltech_db.models import MonthlyRest, MonthlyRestLock, Personnel, Role, RolePersonnel
+from app.services.auth_scope import get_user_scope as resolve_user_scope, is_jwt_admin
 
 
 def get_user_scope(personnel_id: str) -> dict:
@@ -22,48 +23,7 @@ def get_user_scope(personnel_id: str) -> dict:
     返回: { personnelId, role, editablePersonnelIds, team }
       role: 'admin' | 'leader' | 'member'
     """
-    # 开发账号（login_type == "dev"）自动拥有管理员权限
-    try:
-        claims = get_jwt()
-        if claims.get("login_type") == "dev":
-            all_ids = [p.id for p in Personnel.query.filter_by(status="active").all()]
-            return {
-                "personnelId": personnel_id,
-                "role": "admin",
-                "editablePersonnelIds": all_ids,
-                "team": "",
-            }
-    except RuntimeError:
-        pass  # 不在 JWT 上下文中（如 seed 脚本调用），继续正常流程
-
-    person = Personnel.query.get(personnel_id)
-    if not person:
-        return {"personnelId": personnel_id, "role": "member", "editablePersonnelIds": [], "team": ""}
-
-    # 检查是否为管理员
-    admin_role = (
-        db.session.query(RolePersonnel)
-        .join(Role, Role.id == RolePersonnel.role_id)
-        .filter(RolePersonnel.personnel_id == personnel_id, Role.code == "admin")
-        .first()
-    )
-    if admin_role:
-        # 管理员：可以编辑所有在职人员
-        all_ids = [p.id for p in Personnel.query.filter_by(status="active").all()]
-        return {
-            "personnelId": personnel_id,
-            "role": "admin",
-            "editablePersonnelIds": all_ids,
-            "team": person.team,
-        }
-
-    # 组长角色不启用，所有非管理员均为普通成员，只能编辑自己
-    return {
-        "personnelId": personnel_id,
-        "role": "member",
-        "editablePersonnelIds": [personnel_id],
-        "team": person.team,
-    }
+    return resolve_user_scope(personnel_id)
 
 
 def list_monthly_rest(*, year: int | None = None, month: int | None = None) -> list[dict]:
@@ -126,9 +86,8 @@ def save_monthly_rest(data: dict) -> tuple[dict | None, str | None, int]:
     except RuntimeError:
         claims = {}
     editor_personnel_id = claims.get("personnel_id")
-    editor_is_dev = claims.get("login_type") == "dev"
     if isinstance(year, int) and isinstance(month, int) and is_month_locked(year=year, month=month):
-        if not editor_is_dev and (not editor_personnel_id or not _is_admin_personnel(editor_personnel_id)):
+        if not is_jwt_admin():
             return None, f"{year}年{month}月已定稿，员工无法再修改", 403
 
     # 校验是否为周末

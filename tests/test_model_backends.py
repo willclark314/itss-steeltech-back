@@ -5,13 +5,12 @@ import os
 import pymysql
 import pytest
 from dotenv import load_dotenv
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
 from app import create_app
 from app.config import Config
 from steeltech_db.extensions import db
-from steeltech_db.models.user import User
+from steeltech_db.models import AccountPassword
 
 load_dotenv()
 
@@ -105,51 +104,23 @@ def backend_app(request):
 def test_create_all(backend_app):
     with backend_app.app_context():
         tables = db.inspect(db.engine).get_table_names()
-        assert "users" in tables
+        assert "personnel" in tables
+        assert "account_passwords" in tables
+        assert "users" not in tables
 
 
-def test_user_crud(backend_app):
+def test_account_password_crud(backend_app):
     with backend_app.app_context():
-        user = User(username="testuser")
-        user.set_password("secret123")
-        db.session.add(user)
+        row = AccountPassword(account="42601001", password="secret123")
+        db.session.add(row)
         db.session.commit()
 
-        loaded = User.query.filter_by(username="testuser").first()
+        loaded = AccountPassword.query.filter_by(account="42601001").first()
         assert loaded is not None
-        assert loaded.id is not None
-        assert loaded.check_password("secret123")
-        assert not loaded.check_password("wrong")
-        assert loaded.created_at is not None
-
-        data = loaded.to_dict()
-        assert data["username"] == "testuser"
-        assert "id" in data
-        assert "created_at" in data
-
-
-def test_username_unique_constraint(backend_app):
-    with backend_app.app_context():
-        first = User(username="duplicate")
-        first.set_password("pass1")
-        second = User(username="duplicate")
-        second.set_password("pass2")
-        db.session.add(first)
-        db.session.commit()
-        db.session.add(second)
-
-        with pytest.raises(IntegrityError):
-            db.session.commit()
-        db.session.rollback()
+        assert loaded.password == "secret123"
 
 
 def test_login_api_on_backend(backend_app):
-    with backend_app.app_context():
-        user = User(username="admin")
-        user.set_password("123456")
-        db.session.add(user)
-        db.session.commit()
-
     client = backend_app.test_client()
     resp = client.post(
         "/api/auth/login",

@@ -17,8 +17,7 @@ RUN pip install -r requirements.txt gunicorn \
 COPY . .
 
 RUN sed -i 's/\r$//' docker-entrypoint.sh \
-    && chmod +x docker-entrypoint.sh \
-    && mkdir -p instance
+    && chmod +x docker-entrypoint.sh
 
 EXPOSE 5000
 

@@ -4,7 +4,6 @@ from sqlalchemy.pool import StaticPool
 from app import create_app
 from app.config import Config
 from steeltech_db.extensions import db
-from steeltech_db.models.user import User
 
 
 class TestConfig(Config):
@@ -25,10 +24,6 @@ def app():
     app = create_app(TestConfig)
     with app.app_context():
         db.create_all()
-        user = User(username="admin")
-        user.set_password("123456")
-        db.session.add(user)
-        db.session.commit()
         yield app
         db.session.remove()
         db.drop_all()

@@ -9,6 +9,5 @@ __pycache__/
 *$py.class
 build/
 dist/
-instance/
 venv/
 /.temp

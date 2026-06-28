@@ -13,7 +13,7 @@ services:
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-in-production}
       DATABASE_BACKEND: ${DATABASE_BACKEND:-sqlite}
-      SQLITE_DATABASE_PATH: /app/datas/steeltech.db
+      SQLITE_DATABASE_PATH: /itss-steeltech-db/datas/steeltech.db
       DEFAULT_LOGIN_PASSWORD: ${DEFAULT_LOGIN_PASSWORD:-123456}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       MYSQL_HOST: mysql
@@ -22,7 +22,7 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-steeltech}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-itss_steeltech}
     volumes:
-      - backend-instance:/app/instance
+      - steeltech-sqlite-data:/itss-steeltech-db/datas
     depends_on:
       mysql:
         condition: service_healthy
@@ -50,5 +50,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  backend-instance:
+  steeltech-sqlite-data:
   mysql-data:

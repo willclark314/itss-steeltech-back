@@ -69,7 +69,7 @@ python run.py
 
 ### 方式一：SQLite（推荐，开箱即用）
 
-默认使用容器内 SQLite，数据持久化在 Docker 卷 `backend-instance` 中。首次启动会自动建表并写入种子数据。
+默认使用容器内 SQLite，数据库文件位于 `itss-steeltech-db/datas/steeltech.db`，数据持久化在 Docker 卷 `steeltech-sqlite-data` 中。首次启动会自动建表并写入种子数据。
 
 ```powershell
 cd itss-steeltech-back
@@ -212,9 +212,7 @@ itss-steeltech-back/
 │   ├── __init__.py             # 应用工厂，注册扩展、蓝图与 CORS
 │   ├── config.py               # 配置类（MySQL / JWT / CORS）
 │   ├── extensions.py           # db、jwt、migrate、cors 扩展实例
-│   ├── models/                 # 数据模型
-│   │   ├── __init__.py
-│   │   └── user.py             # 用户模型（密码哈希）
+│   ├── services/               # 业务逻辑（认证、人员、项目等）
 │   └── routes/                 # 路由蓝图
 │       ├── __init__.py
 │       └── auth.py             # 认证接口 POST /api/auth/login
@@ -240,10 +238,10 @@ itss-steeltech-back/
 | `app/__init__.py` | `create_app()` 工厂函数，加载 `.env`、初始化扩展、注册 `/api/auth` 蓝图与 `/api/health` |
 | `app/config.py` | 从环境变量读取 MySQL 连接串、JWT 密钥、CORS 白名单 |
 | `app/extensions.py` | 集中声明 SQLAlchemy、JWT、Migrate、CORS 单例，避免循环导入 |
-| `app/models/user.py` | `users` 表：id、username、password_hash、created_at |
+| `app/services/auth_service.py` | 基于 `account_passwords` + `personnel` 校验登录，签发 JWT |
 | `app/routes/auth.py` | 校验用户名密码，签发 JWT Token |
 | `setup_db.py` | 连接 MySQL 服务器，创建 `itss_steeltech` 库（若不存在） |
-| `init_db.py` | `db.create_all()` 建表，创建默认账号 admin/123456 |
+| `init_db.py` | 初始化 SQLite 数据库并确保开发测试账号存在 |
 | `install.ps1` | 设置 `NO_PROXY=*` 后执行 pip install，解决 Clash 代理导致的 SSL 错误 |
 
 ---
@@ -278,7 +276,6 @@ itss-steeltech-back/
 | `app/__init__.py` | 应用工厂 |
 | `app/config.py` | 配置 |
 | `app/extensions.py` | 扩展实例 |
-| `app/models/user.py` | 用户模型 |
 | `app/routes/auth.py` | 登录路由 |
 | `run.py` | 启动入口 |
 | `setup_db.py` | 创建数据库 |

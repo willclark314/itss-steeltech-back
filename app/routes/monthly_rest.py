@@ -7,9 +7,8 @@ from typing import Optional
 from flask import Blueprint, Response, jsonify, request
 from flask_jwt_extended import get_jwt, jwt_required
 
-from steeltech_db.extensions import db
-from steeltech_db.models import Role, RolePersonnel
 from app.services import monthly_rest_service
+from app.services.auth_scope import is_jwt_admin
 
 monthly_rest_bp = Blueprint("monthly_rest", __name__)
 
@@ -118,28 +117,8 @@ def delete_monthly_rest(record_id: str):
 
 
 def _check_is_admin() -> bool:
-    """检查当前 JWT 用户是否为管理员（dev 账号或拥有 admin 角色）"""
-    try:
-        claims = get_jwt()
-    except RuntimeError:
-        return False
-
-    # dev 账号直接通过
-    if claims.get("login_type") == "dev":
-        return True
-
-    # 检查是否拥有 admin 角色
-    personnel_id = claims.get("personnel_id")
-    if not personnel_id:
-        return False
-
-    admin_role = (
-        db.session.query(RolePersonnel)
-        .join(Role, Role.id == RolePersonnel.role_id)
-        .filter(RolePersonnel.personnel_id == personnel_id, Role.code == "admin")
-        .first()
-    )
-    return admin_role is not None
+    """检查当前 JWT 用户是否为管理员（dev admin 账号或拥有 admin 角色）"""
+    return is_jwt_admin()
 
 
 @monthly_rest_bp.get("/export")
