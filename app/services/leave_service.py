@@ -419,7 +419,7 @@ def _compute_cycle_entries(
     """根据策略计算某年内所有计划轮休段（计算值，不入库）
 
     anchor_override:
-      最后实际休假记录的 endDate。传入时，从该日期的下一工作日起算 workDays 后得到下一次休假。
+      结束日期最晚的已保存休假的 endDate。传入时，从该日期的下一工作日起算 workDays 后得到下一次休假。
     future_only:
       True 时仅返回尚未结束的条目，避免与实际记录重叠。
     """
@@ -538,23 +538,24 @@ def get_calendar(
         e.to_dict() for e in entry_query.order_by(PersonnelLeaveEntry.start_date).all()
     ]
 
-    # 全局最晚一条轮休记录（不受当前查看年份限制），用于推算下一次休假
+    # 结束日期最晚的已保存休假（不受当前查看年份限制），用于推算下一次休假
     from sqlalchemy import desc as sa_desc
 
-    regular_query = PersonnelLeaveEntry.query.filter(
-        PersonnelLeaveEntry.type == "regular",
-        PersonnelLeaveEntry.status != "cancelled",
+    latest_query = PersonnelLeaveEntry.query.filter(
+        PersonnelLeaveEntry.status != PersonnelLeaveEntry.STATUS_CANCELLED,
     )
     if scope_personnel_id:
-        regular_query = regular_query.filter_by(personnel_id=scope_personnel_id)
-    all_regular_desc = regular_query.order_by(
+        latest_query = latest_query.filter_by(personnel_id=scope_personnel_id)
+    # 按 end_date 取最晚，与入库先后无关
+    all_latest_desc = latest_query.order_by(
         PersonnelLeaveEntry.personnel_id,
+        sa_desc(PersonnelLeaveEntry.end_date),
         sa_desc(PersonnelLeaveEntry.start_date),
     ).all()
 
     last_entry_map: dict[str, str] = {}
     last_leave_anchors: dict[str, dict] = {}
-    for e in all_regular_desc:
+    for e in all_latest_desc:
         if e.personnel_id not in last_entry_map:
             last_entry_map[e.personnel_id] = e.end_date
             last_leave_anchors[e.personnel_id] = {

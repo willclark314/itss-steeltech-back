@@ -12,7 +12,11 @@ from app.config import Config
 from steeltech_db.extensions import db
 from app.utils.pagination import ListPageQuery, compute_paginated_window
 
-CONTACT_LIST_ORDER = "COALESCE(cf.root_id, cf.id) DESC, cf.sort_order ASC, cf.id ASC"
+CONTACT_LIST_ORDER = (
+    "(SELECT root.received_date FROM contact_forms root "
+    "WHERE root.id = COALESCE(cf.root_id, cf.id)) DESC, "
+    "cf.sort_order ASC, cf.id ASC"
+)
 CONTACT_PDF_ROOT = Path(Config.CONTACT_PDF_STORAGE_ROOT)
 
 
@@ -372,7 +376,17 @@ def _insert_pdf_records(
 
 
 def create_contact(payload: dict) -> dict:
-    contact_id = _generate_contact_id()
+    requested_id = str(payload.get("id", "")).strip()
+    if requested_id:
+        existing = db.session.execute(
+            text("SELECT id FROM contact_forms WHERE id = :id"),
+            {"id": requested_id},
+        ).first()
+        if existing:
+            raise ValueError(f"联系单号 {requested_id} 已存在")
+        contact_id = requested_id
+    else:
+        contact_id = _generate_contact_id()
     created_at = _now_local()
     db.session.execute(
         text(
@@ -405,6 +419,29 @@ def create_contact(payload: dict) -> dict:
     return get_contact_by_id(contact_id)
 
 
+def _rename_contact_id(old_id: str, new_id: str) -> None:
+    ref_updates = [
+        ("contact_form_projects", "contact_form_id"),
+        ("contact_form_projects", "source_contact_form_id"),
+        ("contact_form_pdfs", "contact_form_id"),
+        ("contact_form_project_cancellations", "cancel_contact_id"),
+        ("contact_form_project_cancellations", "target_contact_id"),
+        ("contact_forms", "parent_id"),
+        ("contact_forms", "root_id"),
+    ]
+    db.session.execute(text("PRAGMA foreign_keys = OFF"))
+    for table, column in ref_updates:
+        db.session.execute(
+            text(f"UPDATE {table} SET {column} = :new_id WHERE {column} = :old_id"),
+            {"old_id": old_id, "new_id": new_id},
+        )
+    db.session.execute(
+        text("UPDATE contact_forms SET id = :new_id WHERE id = :old_id"),
+        {"old_id": old_id, "new_id": new_id},
+    )
+    db.session.execute(text("PRAGMA foreign_keys = ON"))
+
+
 def update_contact(contact_id: str, payload: dict) -> dict | None:
     existing = db.session.execute(
         text("SELECT id FROM contact_forms WHERE id = :id"),
@@ -412,6 +449,20 @@ def update_contact(contact_id: str, payload: dict) -> dict | None:
     ).first()
     if not existing:
         return None
+
+    if "id" in payload:
+        new_id = str(payload.get("id", "")).strip()
+        if not new_id:
+            raise ValueError("联系单号不能为空")
+        if new_id != contact_id:
+            conflict = db.session.execute(
+                text("SELECT id FROM contact_forms WHERE id = :id"),
+                {"id": new_id},
+            ).first()
+            if conflict:
+                raise ValueError(f"联系单号 {new_id} 已存在")
+            _rename_contact_id(contact_id, new_id)
+            contact_id = new_id
 
     fields = []
     params: dict = {"id": contact_id, "updated_at": _now_local()}

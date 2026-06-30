@@ -6,6 +6,7 @@ from flask import Flask, send_from_directory
 from app.config import Config
 from app.extensions import cors, jwt
 from app.routes.auth import auth_bp
+from app.routes.backup import backup_bp
 from app.routes.contacts import contacts_bp
 from app.routes.leave import leave_bp
 from app.routes.monthly_rest import monthly_rest_bp
@@ -45,6 +46,7 @@ def create_app(config_class: type[Config] = Config) -> Flask:
     app.register_blueprint(monthly_rest_bp, url_prefix="/api/monthly-rest")
     app.register_blueprint(leave_bp, url_prefix="/api/leave")
     app.register_blueprint(system_bp, url_prefix="/api/system")
+    app.register_blueprint(backup_bp, url_prefix="/api/system/backup")
 
     @app.get("/api/health")
     def health():
@@ -65,5 +67,8 @@ def create_app(config_class: type[Config] = Config) -> Flask:
     with app.app_context():
         ensure_schema(app)
         seed_if_empty(app)
+        # 初始化备份调度器（非阻塞）
+        from app.services.backup_service import BackupService
+        BackupService().init_scheduler(app)
 
     return app

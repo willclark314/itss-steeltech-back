@@ -32,14 +32,20 @@ def create_contact():
     received_date = str(payload.get("receivedDate", "")).strip()
     if not title or not received_date:
         return jsonify({"message": "联系主题和收单日期不能为空"}), 400
-    contact = contact_service.create_contact(payload)
+    try:
+        contact = contact_service.create_contact(payload)
+    except ValueError as exc:
+        return jsonify({"message": str(exc)}), 400
     return jsonify(contact), 201
 
 
 @contacts_bp.put("/<contact_id>")
 def update_contact(contact_id: str):
     payload = request.get_json(silent=True) or {}
-    contact = contact_service.update_contact(contact_id, payload)
+    try:
+        contact = contact_service.update_contact(contact_id, payload)
+    except ValueError as exc:
+        return jsonify({"message": str(exc)}), 400
     if not contact:
         return jsonify({"message": "联系单不存在"}), 404
     return jsonify(contact)
