@@ -27,7 +27,11 @@ def backup_config():
 def trigger_backup():
     try:
         record = service.backup_now(current_app, trigger_type="manual")
-        return jsonify({"message": "备份完成", "record": record.to_dict()})
+        backup_dir = service._get_backup_root(current_app)
+        return jsonify({
+            "message": "备份完成",
+            "record": service.record_to_dict(record, backup_dir),
+        })
     except Exception as exc:
         return jsonify({"message": f"备份失败: {exc}"}), 500
 
@@ -36,7 +40,7 @@ def trigger_backup():
 def backup_history():
     page = request.args.get("page", 1, type=int)
     per_page = request.args.get("per_page", 20, type=int)
-    return jsonify(service.get_history(page, per_page))
+    return jsonify(service.get_history(current_app, page, per_page))
 
 
 @backup_bp.get("/download/<int:record_id>")
@@ -47,11 +51,20 @@ def download_backup(record_id: int):
     config = service.get_config()
     from pathlib import Path
 
-    file_path = Path(current_app.root_path).parent / config.backup_dir / record.filename
+    requested = request.args.get("file", "db").strip().lower()
+    backup_dir = Path(current_app.root_path).parent / config.backup_dir
+    if requested == "files":
+        filename = service.files_archive_name_for(record.filename)
+        if not filename:
+            return jsonify({"message": "该备份无文件包"}), 404
+    else:
+        filename = record.filename
+
+    file_path = backup_dir / filename
     if not file_path.exists():
         return jsonify({"message": "备份文件不存在"}), 404
 
-    return send_file(file_path, as_attachment=True, download_name=record.filename)
+    return send_file(file_path, as_attachment=True, download_name=filename)
 
 
 @backup_bp.delete("/<int:record_id>")

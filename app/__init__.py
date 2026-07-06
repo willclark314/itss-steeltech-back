@@ -8,6 +8,7 @@ from app.extensions import cors, jwt
 from app.routes.auth import auth_bp
 from app.routes.backup import backup_bp
 from app.routes.contacts import contacts_bp
+from app.routes.detail_team_schedule import detail_team_schedule_bp
 from app.routes.leave import leave_bp
 from app.routes.monthly_rest import monthly_rest_bp
 from app.routes.permissions import permissions_bp
@@ -15,6 +16,8 @@ from app.routes.personnel import personnel_bp
 from app.routes.projects import projects_bp
 from app.routes.roles import roles_bp
 from app.routes.system import system_bp
+from app.routes.tags import tags_bp
+from app.routes.temp_tasks import temp_tasks_bp
 from steeltech_db.extensions import db, migrate
 from steeltech_db.seed import bootstrap_sqlite_file, ensure_schema, seed_if_empty
 
@@ -42,7 +45,10 @@ def create_app(config_class: type[Config] = Config) -> Flask:
     app.register_blueprint(permissions_bp, url_prefix="/api/permissions")
     app.register_blueprint(roles_bp, url_prefix="/api/roles")
     app.register_blueprint(projects_bp, url_prefix="/api/projects")
+    app.register_blueprint(detail_team_schedule_bp, url_prefix="/api/detail-team-schedule")
     app.register_blueprint(contacts_bp, url_prefix="/api/contacts")
+    app.register_blueprint(tags_bp, url_prefix="/api/tags")
+    app.register_blueprint(temp_tasks_bp, url_prefix="/api/temp-tasks")
     app.register_blueprint(monthly_rest_bp, url_prefix="/api/monthly-rest")
     app.register_blueprint(leave_bp, url_prefix="/api/leave")
     app.register_blueprint(system_bp, url_prefix="/api/system")
@@ -62,7 +68,8 @@ def create_app(config_class: type[Config] = Config) -> Flask:
 
     @app.get("/api/contact-pdfs/<path:file_path>")
     def serve_contact_pdfs(file_path: str):
-        return send_from_directory(contact_pdf_root, file_path)
+        normalized_path = file_path.replace("\\", "/")
+        return send_from_directory(str(contact_pdf_root), normalized_path)
 
     with app.app_context():
         ensure_schema(app)

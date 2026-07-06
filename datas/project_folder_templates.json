@@ -22,10 +22,11 @@
     "name": "细化组项目目录",
     "description": "适用于细化/加工单归档项目，从 path_template 复制标准目录结构与样板文件",
     "sourceDir": "path_template",
-    "sourceRoot": "（空样板！勿剪切）工程编号#项目名称【待安排@@】(需排瓦&不排瓦)(GJGJSK-2026.3.10版)",
-    "unwrapMainProjectDir": true,
+    "sourceRoot": "（空样板！勿剪切）工程编号#项目名称【待安排@@】(需排瓦&不排瓦)(GJGJSK-2026.3.10版)\\（空样板！勿剪切）工程编号#项目名称【待安排@@】(需排瓦&不排瓦)(GJGJSK-2026.3.10版)",
+    "sourceRootJiagongdan": "工程编号#项目名称【甲供】【待安排@@】(需排瓦&不排瓦)(GJGJSK-2026.1.23版)",
+    "preserveSourceRoot": true,
     "nameTokens": {
-      "工程编号": "{projectNoDigits}",
+      "工程编号": "{projectNo}",
       "项目名称": "{projectName}",
       "工程名称": "{projectName}"
     },

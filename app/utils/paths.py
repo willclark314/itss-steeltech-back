@@ -67,3 +67,16 @@ def build_full_path(relative_path: str, config: dict | None = None) -> str:
     ip = str(work_path.get("ip", "")).strip()
     drive = normalize_drive(str(work_path.get("drive", "F")))
     return build_full_path_with_ip(relative_path, ip, drive, work_path)
+
+
+def normalize_access_path(full_path: str) -> str:
+    """将 UNC 路径转换为当前系统可访问的形式。
+
+    在部分 Windows 环境下，\\\\ip\\share\\path 无法访问，但 //ip/share/path 可以。
+    """
+    trimmed = (full_path or "").strip()
+    if not trimmed:
+        return ""
+    if trimmed.startswith("\\\\"):
+        return trimmed.replace("\\", "/")
+    return trimmed

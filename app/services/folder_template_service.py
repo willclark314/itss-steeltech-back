@@ -384,16 +384,32 @@ def _generate_from_source(
     if not source_dir:
         raise FolderTemplateError("模板未配置 sourceDir")
 
-    source_root_name = str(template.get("sourceRoot") or "").strip()
     source_base = FILES_DIR / source_dir.replace("/", "\\").strip("\\")
-    source_root = source_base / source_root_name if source_root_name else source_base
+    source_root_name = str(template.get("sourceRoot") or "").strip()
+    source_root_jiagongdan = str(template.get("sourceRootJiagongdan") or "").strip()
+    is_jiagongdan = str(variables.get("isJiagongdan") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
+
+    selected_root_name = source_root_jiagongdan if (is_jiagongdan and source_root_jiagongdan) else source_root_name
+    source_root = source_base / selected_root_name if selected_root_name else source_base
 
     if not source_root.exists() or not source_root.is_dir():
         raise FolderTemplateError(f"模板源目录不存在: {source_root}")
 
-    for child in sorted(source_root.iterdir(), key=lambda item: item.name.lower()):
+    preserve_source_root = bool(template.get("preserveSourceRoot"))
+    managed_root = project_root
+    if preserve_source_root:
+        managed_root = project_root / _translate_name(
+            source_root.name,
+            variables,
+            template.get("nameTokens") if isinstance(template.get("nameTokens"), dict) else {},
+        )
         _copy_source_entry(
-            child,
+            source_root,
             project_root,
             variables,
             template,
@@ -403,15 +419,28 @@ def _generate_from_source(
             created_files,
             skipped_files,
         )
+    else:
+        for child in sorted(source_root.iterdir(), key=lambda item: item.name.lower()):
+            _copy_source_entry(
+                child,
+                project_root,
+                variables,
+                template,
+                skip_existing,
+                created_dirs,
+                skipped_dirs,
+                created_files,
+                skipped_files,
+            )
 
-    managed_dirs = [path for path in project_root.rglob("*") if path.is_dir()]
-    managed_dirs.append(project_root)
+    managed_dirs = [path for path in managed_root.rglob("*") if path.is_dir()]
+    managed_dirs.append(managed_root)
     managed_dirs.sort(key=lambda path: len(path.parts))
 
     for directory in managed_dirs:
         _write_directory_readme(
             directory,
-            project_root,
+            managed_root,
             variables,
             template,
             skip_existing,
@@ -420,7 +449,7 @@ def _generate_from_source(
         )
 
     _write_pack_readme_files(
-        project_root,
+        managed_root,
         variables,
         template,
         skip_existing,

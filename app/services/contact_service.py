@@ -5,19 +5,33 @@ import hashlib
 import uuid
 from datetime import datetime
 from pathlib import Path
+import re
 
 from sqlalchemy import text
 
 from app.config import Config
+from app.services import tag_service
+from app.services.project_service import resolve_project_no
 from steeltech_db.extensions import db
+from steeltech_db.project_status import PROJECT_STATUS_CANCELLED
 from app.utils.pagination import ListPageQuery, compute_paginated_window
 
+FAMILY_MAX_RECEIVED_DATE = (
+    "(SELECT MAX(family.received_date) FROM contact_forms family "
+    "WHERE family.root_id = COALESCE(cf.root_id, cf.id) "
+    "AND family.deleted_at IS NULL)"
+)
 CONTACT_LIST_ORDER = (
-    "(SELECT root.received_date FROM contact_forms root "
-    "WHERE root.id = COALESCE(cf.root_id, cf.id)) DESC, "
+    f"{FAMILY_MAX_RECEIVED_DATE} DESC, "
+    "COALESCE((SELECT MAX(cfp.project_no) FROM contact_form_projects cfp "
+    "WHERE cfp.contact_form_id = cf.id), '') DESC, "
     "cf.sort_order ASC, cf.id ASC"
 )
+CONTACT_LIST_SELECT = f"cf.*, {FAMILY_MAX_RECEIVED_DATE} AS family_max_received_date"
 CONTACT_PDF_ROOT = Path(Config.CONTACT_PDF_STORAGE_ROOT)
+PROCESSING_CONTACT_ID = "加工单"
+PROCESSING_CONTACT_ID_PREFIX = "加工单-"
+PROCESSING_CONTACT_ID_PATTERN = re.compile(r"^BRD\d{6}C\d{9}$", re.IGNORECASE)
 
 
 def _row_to_dict(row) -> dict:
@@ -39,6 +53,19 @@ def _generate_contact_id() -> str:
     return f"{prefix}{count + 1}"
 
 
+def _is_processing_contact_id(contact_id: str) -> bool:
+    normalized = (contact_id or "").strip()
+    return (
+        normalized == PROCESSING_CONTACT_ID
+        or normalized.startswith(PROCESSING_CONTACT_ID_PREFIX)
+        or bool(PROCESSING_CONTACT_ID_PATTERN.fullmatch(normalized))
+    )
+
+
+def _generate_processing_contact_id() -> str:
+    return f"{PROCESSING_CONTACT_ID_PREFIX}{int(datetime.now().timestamp() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+
 def _generate_pdf_id() -> str:
     return f"pdf_{int(datetime.now().timestamp() * 1000)}_{uuid.uuid4().hex[:6]}"
 
@@ -47,22 +74,123 @@ def _generate_cancellation_id() -> str:
     return f"canc_{int(datetime.now().timestamp() * 1000)}_{uuid.uuid4().hex[:6]}"
 
 
-def _save_pdf_file(contact_form_id: str, _file_name: str, content: str) -> dict:
-    content_bytes = base64.b64decode(content)
-    file_md5 = hashlib.md5(content_bytes).hexdigest()
-    # 日期目录：yyyyMMdd（例如 20260611），不使用斜杠
+def _normalize_pdf_relative_path(file_path: str) -> str:
+    return file_path.replace("\\", "/")
+
+
+def _has_pdf_payload(file: dict | None) -> bool:
+    if not file:
+        return False
+    return bool(file.get("content") or str(file.get("md5", "")).strip())
+
+
+def find_existing_pdf_by_md5(file_md5: str) -> dict | None:
+    file_md5 = file_md5.strip().lower()
+    if len(file_md5) != 32:
+        return None
+
+    row = db.session.execute(
+        text(
+            """
+            SELECT file_path, file_size, file_name
+            FROM contact_form_pdfs
+            WHERE file_md5 = :file_md5
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"file_md5": file_md5},
+    ).first()
+    if row and row.file_path:
+        relative_path = _normalize_pdf_relative_path(row.file_path)
+        abs_path = CONTACT_PDF_ROOT / Path(relative_path)
+        if abs_path.is_file():
+            return {
+                "file_name": row.file_name,
+                "file_path": relative_path,
+                "file_md5": file_md5,
+                "file_size": int(row.file_size or abs_path.stat().st_size),
+                "deduplicated": True,
+            }
+
+    for abs_path in CONTACT_PDF_ROOT.rglob(f"{file_md5}.pdf"):
+        if not abs_path.is_file():
+            continue
+        relative_path = abs_path.relative_to(CONTACT_PDF_ROOT).as_posix()
+        return {
+            "file_name": f"{file_md5}.pdf",
+            "file_path": relative_path,
+            "file_md5": file_md5,
+            "file_size": abs_path.stat().st_size,
+            "deduplicated": True,
+        }
+    return None
+
+
+def check_pdf_md5(file_md5: str) -> dict:
+    existing = find_existing_pdf_by_md5(file_md5)
+    if not existing:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "fileMd5": existing["file_md5"],
+        "fileSize": existing["file_size"],
+        "filePath": existing["file_path"],
+    }
+
+
+def _resolve_pdf_storage(
+    *,
+    file_name: str,
+    content: str | None = None,
+    md5: str | None = None,
+) -> dict:
+    file_md5 = str(md5 or "").strip().lower()
+    content_bytes: bytes | None = None
+
+    if content:
+        content_bytes = base64.b64decode(content)
+        computed_md5 = hashlib.md5(content_bytes).hexdigest()
+        if file_md5 and file_md5 != computed_md5:
+            raise ValueError("文件校验失败，请重新上传")
+        file_md5 = computed_md5
+    elif not file_md5:
+        raise ValueError("请提供 PDF 文件内容或 MD5")
+
+    existing = find_existing_pdf_by_md5(file_md5)
+    if existing:
+        return existing
+
+    if content_bytes is None:
+        raise ValueError("服务器未找到该文件，请重新上传完整文件")
+
     dated_path = datetime.now().strftime("%Y%m%d")
     target_dir = CONTACT_PDF_ROOT / dated_path
     target_dir.mkdir(parents=True, exist_ok=True)
     file_path = target_dir / f"{file_md5}.pdf"
-    file_path.write_bytes(content_bytes)
+    if not file_path.exists():
+        file_path.write_bytes(content_bytes)
     relative_path = f"{dated_path}/{file_md5}.pdf"
     return {
         "file_name": f"{file_md5}.pdf",
         "file_path": relative_path,
         "file_md5": file_md5,
         "file_size": file_path.stat().st_size,
+        "deduplicated": False,
     }
+
+
+def _soft_delete_contact_pdfs(contact_form_id: str, deleted_at: str) -> None:
+    db.session.execute(
+        text(
+            """
+            UPDATE contact_form_pdfs
+            SET deleted_at = :deleted_at
+            WHERE contact_form_id = :contact_form_id AND deleted_at IS NULL
+            """
+        ),
+        {"contact_form_id": contact_form_id, "deleted_at": deleted_at},
+    )
 
 
 def get_project_links_map(contact_form_ids: list[str]) -> dict[str, list[dict]]:
@@ -93,35 +221,48 @@ def get_project_links_map(contact_form_ids: list[str]) -> dict[str, list[dict]]:
     return result
 
 
-def get_pdfs_map(contact_form_ids: list[str]) -> tuple[dict[str, dict], dict[str, list[dict]]]:
+def get_pdfs_map(contact_form_ids: list[str]) -> tuple[dict[str, dict], dict[str, list[dict]], dict[str, list[dict]]]:
     if not contact_form_ids:
-        return {}, {}
+        return {}, {}, {}
     placeholders = ", ".join(f":c{i}" for i in range(len(contact_form_ids)))
     params = {f"c{i}": value for i, value in enumerate(contact_form_ids)}
     rows = db.session.execute(
         text(
             f"""
-            SELECT contact_form_id, id, file_name, file_path, attachment_type
+            SELECT contact_form_id, id, file_name, file_path, attachment_type,
+                   created_at, is_current, original_file_name
             FROM contact_form_pdfs
             WHERE contact_form_id IN ({placeholders})
+              AND deleted_at IS NULL
             ORDER BY sort_order, created_at
             """
         ),
         params,
     ).all()
     primary_map: dict[str, dict] = {}
+    primary_versions_map: dict[str, list[dict]] = {}
     supplement_map: dict[str, list[dict]] = {}
     for row in rows:
         item = {
             "id": row.id,
-            "name": row.file_name,
+            "name": row.original_file_name or row.file_name,
             "url": f"/api/contact-pdfs/{(row.file_path or '').replace(chr(92), '/')}",
+            "createdAt": row.created_at,
+            "isCurrent": bool(row.is_current),
         }
         if row.attachment_type == "primary":
-            primary_map[row.contact_form_id] = item
+            primary_versions_map.setdefault(row.contact_form_id, []).append(item)
             continue
         supplement_map.setdefault(row.contact_form_id, []).append(item)
-    return primary_map, supplement_map
+
+    for contact_id, versions in primary_versions_map.items():
+        versions.sort(key=lambda entry: entry["createdAt"], reverse=True)
+        for index, entry in enumerate(versions):
+            entry["version"] = len(versions) - index
+        current = next((entry for entry in versions if entry.get("isCurrent")), versions[0])
+        primary_map[contact_id] = current
+
+    return primary_map, supplement_map, primary_versions_map
 
 
 def get_child_count_map(root_ids: list[str]) -> dict[str, int]:
@@ -135,6 +276,7 @@ def get_child_count_map(root_ids: list[str]) -> dict[str, int]:
             SELECT root_id, COUNT(*) AS total
             FROM contact_forms
             WHERE root_id IN ({placeholders})
+              AND deleted_at IS NULL
             GROUP BY root_id
             """
         ),
@@ -148,7 +290,9 @@ def map_contact(
     project_links_map: dict[str, list[dict]],
     primary_map: dict[str, dict],
     supplement_map: dict[str, list[dict]],
+    primary_versions_map: dict[str, list[dict]],
     child_count_map: dict[str, int],
+    tags_map: dict[str, list[dict]] | None = None,
 ) -> dict:
     contact_id = row["id"]
     project_links = project_links_map.get(contact_id, [])
@@ -157,11 +301,12 @@ def map_contact(
         "title": row["title"],
         "projectNos": [item["projectNo"] for item in project_links],
         "projectLinks": project_links,
+        "tags": (tags_map or {}).get(contact_id, []),
         "receivedDate": row["received_date"],
+        "familyMaxReceivedDate": row.get("family_max_received_date") or row["received_date"],
         "urgency": row["urgency"],
         "status": row["status"],
         "content": row.get("content") or "",
-        "expectReplyDate": row.get("expect_reply_date") or "",
         "parentId": row.get("parent_id") or None,
         "rootId": row.get("root_id") or contact_id,
         "relationType": row.get("relation_type") or "primary",
@@ -169,6 +314,7 @@ def map_contact(
         "childCount": child_count_map.get(row.get("root_id") or contact_id, 0),
         "cancelScope": row.get("cancel_scope") or None,
         "primaryPdf": primary_map.get(contact_id),
+        "primaryPdfVersions": primary_versions_map.get(contact_id, []),
         "attachments": supplement_map.get(contact_id, []),
         "createdAt": row["created_at"],
     }
@@ -176,21 +322,57 @@ def map_contact(
 
 def get_contact_by_id(contact_id: str) -> dict | None:
     row = db.session.execute(
-        text("SELECT * FROM contact_forms WHERE id = :id"),
+        text(
+            f"""
+            SELECT {CONTACT_LIST_SELECT}
+            FROM contact_forms cf
+            WHERE cf.id = :id AND cf.deleted_at IS NULL
+            """
+        ),
         {"id": contact_id},
     ).first()
     if not row:
         return None
     contact_row = _row_to_dict(row)
     project_links_map = get_project_links_map([contact_id])
-    primary_map, supplement_map = get_pdfs_map([contact_id])
+    primary_map, supplement_map, primary_versions_map = get_pdfs_map([contact_id])
     child_count_map = get_child_count_map([contact_row.get("root_id") or contact_id])
-    return map_contact(contact_row, project_links_map, primary_map, supplement_map, child_count_map)
+    tags_map = tag_service.get_contact_tags_map([contact_id])
+    return map_contact(
+        contact_row, project_links_map, primary_map, supplement_map, primary_versions_map, child_count_map, tags_map
+    )
 
 
-def build_contact_filters(keyword: str, status: str) -> tuple[str, dict]:
-    conditions: list[str] = []
+def build_contact_filters(
+    keyword: str,
+    status: str,
+    assigned_personnel_id: str = "",
+    tag_ids: list[str] | None = None,
+) -> tuple[str, dict]:
+    conditions: list[str] = ["cf.deleted_at IS NULL"]
     params: dict = {}
+
+    personnel_id = (assigned_personnel_id or "").strip()
+    if personnel_id:
+        conditions.append(
+            """EXISTS (
+              SELECT 1 FROM contact_form_projects cfp
+              INNER JOIN project_personnel pp ON pp.project_no = cfp.project_no
+              WHERE cfp.contact_form_id = cf.id AND pp.personnel_id = :assigned_personnel_id
+            )"""
+        )
+        params["assigned_personnel_id"] = personnel_id
+
+    tag_clause, tag_params = tag_service.build_tag_exists_clause(
+        entity_id_column="cf.id",
+        join_table="contact_form_tags",
+        join_entity_column="contact_form_id",
+        tag_ids=tag_ids or [],
+        param_prefix="contact_filter_tag",
+    )
+    if tag_clause:
+        conditions.append(tag_clause)
+        params.update(tag_params)
 
     if status:
         conditions.append("cf.status = :status")
@@ -207,11 +389,16 @@ def build_contact_filters(keyword: str, status: str) -> tuple[str, dict]:
                 FROM contact_form_projects cfp
                 WHERE cfp.contact_form_id = cf.id AND LOWER(cfp.project_no) LIKE :kw
               )
+              OR EXISTS (
+                SELECT 1 FROM contact_form_tags cft
+                INNER JOIN tags t ON t.id = cft.tag_id
+                WHERE cft.contact_form_id = cf.id AND LOWER(t.name) LIKE :kw
+              )
             )"""
         )
         params["kw"] = f"%{keyword}%"
 
-    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    where_clause = f"WHERE {' AND '.join(conditions)}"
     return where_clause, params
 
 
@@ -232,14 +419,61 @@ def get_contact_rank(where_clause: str, params: dict, contact_id: str) -> int | 
     return int(row.rank) if row else None
 
 
-def list_contacts(*, keyword: str = "", status: str = "", page_query: ListPageQuery) -> dict:
+def list_contacts(
+    *,
+    keyword: str = "",
+    status: str = "",
+    assigned_personnel_id: str = "",
+    tag_ids: list[str] | None = None,
+    page_query: ListPageQuery,
+    load_all: bool = False,
+) -> dict:
     keyword = keyword.strip().lower()
-    where_clause, params = build_contact_filters(keyword, status)
+    where_clause, params = build_contact_filters(keyword, status, assigned_personnel_id, tag_ids)
 
     total = db.session.execute(
         text(f"SELECT COUNT(*) AS total FROM contact_forms cf {where_clause}"),
         params,
     ).scalar_one()
+
+    if load_all:
+        rows = db.session.execute(
+            text(
+                f"""
+                SELECT {CONTACT_LIST_SELECT}
+                FROM contact_forms cf
+                {where_clause}
+                ORDER BY {CONTACT_LIST_ORDER}
+                """
+            ),
+            params,
+        ).all()
+        contact_rows = [_row_to_dict(row) for row in rows]
+        contact_ids = [row["id"] for row in contact_rows]
+        root_ids = list({row.get("root_id") or row["id"] for row in contact_rows})
+        project_links_map = get_project_links_map(contact_ids)
+        primary_map, supplement_map, primary_versions_map = get_pdfs_map(contact_ids)
+        child_count_map = get_child_count_map(root_ids)
+        tags_map = tag_service.get_contact_tags_map(contact_ids)
+        items = [
+            map_contact(
+                row,
+                project_links_map,
+                primary_map,
+                supplement_map,
+                primary_versions_map,
+                child_count_map,
+                tags_map,
+            )
+            for row in contact_rows
+        ]
+        return {
+            "list": items,
+            "total": total,
+            "page": 1,
+            "pageSize": len(items),
+            "totalPages": 1,
+        }
 
     anchor_index = None
     if page_query.anchor:
@@ -255,7 +489,7 @@ def list_contacts(*, keyword: str = "", status: str = "", page_query: ListPageQu
     rows = db.session.execute(
         text(
             f"""
-            SELECT cf.*
+            SELECT {CONTACT_LIST_SELECT}
             FROM contact_forms cf
             {where_clause}
             ORDER BY {CONTACT_LIST_ORDER}
@@ -269,10 +503,19 @@ def list_contacts(*, keyword: str = "", status: str = "", page_query: ListPageQu
     contact_ids = [row["id"] for row in contact_rows]
     root_ids = list({row.get("root_id") or row["id"] for row in contact_rows})
     project_links_map = get_project_links_map(contact_ids)
-    primary_map, supplement_map = get_pdfs_map(contact_ids)
+    primary_map, supplement_map, primary_versions_map = get_pdfs_map(contact_ids)
     child_count_map = get_child_count_map(root_ids)
+    tags_map = tag_service.get_contact_tags_map(contact_ids)
     items = [
-        map_contact(row, project_links_map, primary_map, supplement_map, child_count_map)
+        map_contact(
+            row,
+            project_links_map,
+            primary_map,
+            supplement_map,
+            primary_versions_map,
+            child_count_map,
+            tags_map,
+        )
         for row in contact_rows
     ]
 
@@ -287,6 +530,7 @@ def list_contacts(*, keyword: str = "", status: str = "", page_query: ListPageQu
 
 def _insert_project_links(contact_form_id: str, links: list[dict]) -> None:
     for link in links:
+        resolved_project_no = resolve_project_no(link["projectNo"])
         db.session.execute(
             text(
                 """
@@ -297,7 +541,7 @@ def _insert_project_links(contact_form_id: str, links: list[dict]) -> None:
             ),
             {
                 "contact_form_id": contact_form_id,
-                "project_no": link["projectNo"],
+                "project_no": resolved_project_no,
                 "source_type": link["sourceType"],
                 "source_contact_form_id": link.get("sourceContactFormId"),
             },
@@ -313,15 +557,22 @@ def _insert_pdf_records(
     created_at = created_at or _now_local()
     supplement_files = supplement_files or []
 
-    if primary_pdf and primary_pdf.get("content"):
-        saved = _save_pdf_file(contact_form_id, primary_pdf["fileName"], primary_pdf["content"])
+    if primary_pdf and _has_pdf_payload(primary_pdf):
+        saved = _resolve_pdf_storage(
+            file_name=str(primary_pdf.get("fileName") or ""),
+            content=primary_pdf.get("content"),
+            md5=primary_pdf.get("md5"),
+        )
         db.session.execute(
             text(
                 """
                 INSERT INTO contact_form_pdfs (
                   id, contact_form_id, file_name, file_path, file_md5, file_size, mime_type,
-                  attachment_type, sort_order, created_at
-                ) VALUES (:id, :contact_form_id, :file_name, :file_path, :file_md5, :file_size, :mime_type, 'primary', 0, :created_at)
+                  attachment_type, sort_order, is_current, original_file_name, created_at
+                ) VALUES (
+                  :id, :contact_form_id, :file_name, :file_path, :file_md5, :file_size, :mime_type,
+                  'primary', 0, 1, :original_file_name, :created_at
+                )
                 """
             ),
             {
@@ -332,6 +583,7 @@ def _insert_pdf_records(
                 "file_md5": saved["file_md5"],
                 "file_size": saved["file_size"],
                 "mime_type": "application/pdf",
+                "original_file_name": primary_pdf.get("fileName") or saved["file_name"],
                 "created_at": created_at,
             },
         )
@@ -342,6 +594,7 @@ def _insert_pdf_records(
             SELECT COALESCE(MAX(sort_order), 0) AS max_sort
             FROM contact_form_pdfs
             WHERE contact_form_id = :contact_form_id AND attachment_type = 'supplement'
+              AND deleted_at IS NULL
             """
         ),
         {"contact_form_id": contact_form_id},
@@ -349,16 +602,23 @@ def _insert_pdf_records(
     max_sort = int(max_sort_row.max_sort) if max_sort_row else 0
 
     for index, file in enumerate(supplement_files):
-        if not file.get("content"):
+        if not _has_pdf_payload(file):
             continue
-        saved = _save_pdf_file(contact_form_id, file["fileName"], file["content"])
+        saved = _resolve_pdf_storage(
+            file_name=str(file.get("fileName") or ""),
+            content=file.get("content"),
+            md5=file.get("md5"),
+        )
         db.session.execute(
             text(
                 """
                 INSERT INTO contact_form_pdfs (
                   id, contact_form_id, file_name, file_path, file_md5, file_size, mime_type,
-                  attachment_type, sort_order, created_at
-                ) VALUES (:id, :contact_form_id, :file_name, :file_path, :file_md5, :file_size, :mime_type, 'supplement', :sort_order, :created_at)
+                  attachment_type, sort_order, is_current, original_file_name, created_at
+                ) VALUES (
+                  :id, :contact_form_id, :file_name, :file_path, :file_md5, :file_size, :mime_type,
+                  'supplement', :sort_order, 1, :original_file_name, :created_at
+                )
                 """
             ),
             {
@@ -370,21 +630,76 @@ def _insert_pdf_records(
                 "file_size": saved["file_size"],
                 "mime_type": "application/pdf",
                 "sort_order": max_sort + index + 1,
+                "original_file_name": file.get("fileName") or saved["file_name"],
                 "created_at": created_at,
             },
         )
 
 
+def _append_primary_pdf_version(
+    contact_form_id: str,
+    primary_pdf: dict,
+    created_at: str | None = None,
+) -> None:
+    if not _has_pdf_payload(primary_pdf):
+        return
+
+    created_at = created_at or _now_local()
+    saved = _resolve_pdf_storage(
+        file_name=str(primary_pdf.get("fileName") or ""),
+        content=primary_pdf.get("content"),
+        md5=primary_pdf.get("md5"),
+    )
+    db.session.execute(
+        text(
+            """
+            UPDATE contact_form_pdfs
+            SET is_current = 0
+            WHERE contact_form_id = :contact_form_id AND attachment_type = 'primary'
+              AND deleted_at IS NULL
+            """
+        ),
+        {"contact_form_id": contact_form_id},
+    )
+    db.session.execute(
+        text(
+            """
+            INSERT INTO contact_form_pdfs (
+              id, contact_form_id, file_name, file_path, file_md5, file_size, mime_type,
+              attachment_type, sort_order, is_current, original_file_name, created_at
+            ) VALUES (
+              :id, :contact_form_id, :file_name, :file_path, :file_md5, :file_size, :mime_type,
+              'primary', 0, 1, :original_file_name, :created_at
+            )
+            """
+        ),
+        {
+            "id": _generate_pdf_id(),
+            "contact_form_id": contact_form_id,
+            "file_name": saved["file_name"],
+            "file_path": saved["file_path"],
+            "file_md5": saved["file_md5"],
+            "file_size": saved["file_size"],
+            "mime_type": "application/pdf",
+            "original_file_name": primary_pdf.get("fileName") or saved["file_name"],
+            "created_at": created_at,
+        },
+    )
+
+
 def create_contact(payload: dict) -> dict:
     requested_id = str(payload.get("id", "")).strip()
     if requested_id:
-        existing = db.session.execute(
-            text("SELECT id FROM contact_forms WHERE id = :id"),
-            {"id": requested_id},
-        ).first()
-        if existing:
-            raise ValueError(f"联系单号 {requested_id} 已存在")
-        contact_id = requested_id
+        if _is_processing_contact_id(requested_id):
+            contact_id = _generate_processing_contact_id()
+        else:
+            existing = db.session.execute(
+                text("SELECT id FROM contact_forms WHERE id = :id"),
+                {"id": requested_id},
+            ).first()
+            if existing:
+                raise ValueError(f"联系单号 {requested_id} 已存在")
+            contact_id = requested_id
     else:
         contact_id = _generate_contact_id()
     created_at = _now_local()
@@ -395,7 +710,7 @@ def create_contact(payload: dict) -> dict:
               id, title, received_date, urgency, status, content, expect_reply_date,
               parent_id, root_id, relation_type, sort_order, created_at, updated_at
             ) VALUES (
-              :id, :title, :received_date, :urgency, 'pending', :content, :expect_reply_date,
+              :id, :title, :received_date, :urgency, 'pending', :content, '',
               NULL, :root_id, 'primary', 0, :created_at, :updated_at
             )
             """
@@ -406,7 +721,6 @@ def create_contact(payload: dict) -> dict:
             "received_date": payload["receivedDate"],
             "urgency": payload.get("urgency") or "普通",
             "content": payload.get("content") or "",
-            "expect_reply_date": payload.get("expectReplyDate") or "",
             "root_id": contact_id,
             "created_at": created_at,
             "updated_at": created_at,
@@ -414,6 +728,11 @@ def create_contact(payload: dict) -> dict:
     )
     links = [{"projectNo": no, "sourceType": "own"} for no in payload.get("projectNos") or []]
     _insert_project_links(contact_id, links)
+    if "tagIds" in payload:
+        tag_ids, tag_error = tag_service.normalize_tag_ids(payload.get("tagIds"))
+        if tag_error:
+            raise ValueError(tag_error)
+        tag_service.sync_contact_tags(contact_id, tag_ids)
     _insert_pdf_records(contact_id, payload.get("primaryPdf"), payload.get("supplementFiles"), created_at)
     db.session.commit()
     return get_contact_by_id(contact_id)
@@ -424,6 +743,7 @@ def _rename_contact_id(old_id: str, new_id: str) -> None:
         ("contact_form_projects", "contact_form_id"),
         ("contact_form_projects", "source_contact_form_id"),
         ("contact_form_pdfs", "contact_form_id"),
+        ("contact_form_tags", "contact_form_id"),
         ("contact_form_project_cancellations", "cancel_contact_id"),
         ("contact_form_project_cancellations", "target_contact_id"),
         ("contact_forms", "parent_id"),
@@ -444,7 +764,7 @@ def _rename_contact_id(old_id: str, new_id: str) -> None:
 
 def update_contact(contact_id: str, payload: dict) -> dict | None:
     existing = db.session.execute(
-        text("SELECT id FROM contact_forms WHERE id = :id"),
+        text("SELECT id FROM contact_forms WHERE id = :id AND deleted_at IS NULL"),
         {"id": contact_id},
     ).first()
     if not existing:
@@ -454,6 +774,8 @@ def update_contact(contact_id: str, payload: dict) -> dict | None:
         new_id = str(payload.get("id", "")).strip()
         if not new_id:
             raise ValueError("联系单号不能为空")
+        if _is_processing_contact_id(new_id):
+            new_id = contact_id if _is_processing_contact_id(contact_id) else _generate_processing_contact_id()
         if new_id != contact_id:
             conflict = db.session.execute(
                 text("SELECT id FROM contact_forms WHERE id = :id"),
@@ -471,7 +793,6 @@ def update_contact(contact_id: str, payload: dict) -> dict | None:
         "receivedDate": "received_date",
         "urgency": "urgency",
         "content": "content",
-        "expectReplyDate": "expect_reply_date",
         "status": "status",
     }
     for key, column in mapping.items():
@@ -494,13 +815,22 @@ def update_contact(contact_id: str, payload: dict) -> dict | None:
         links = [{"projectNo": no, "sourceType": "own"} for no in payload["projectNos"]]
         _insert_project_links(contact_id, links)
 
+    if "tagIds" in payload:
+        tag_ids, tag_error = tag_service.normalize_tag_ids(payload.get("tagIds"))
+        if tag_error:
+            raise ValueError(tag_error)
+        tag_service.sync_contact_tags(contact_id, tag_ids)
+
+    if payload.get("primaryPdf"):
+        _append_primary_pdf_version(contact_id, payload["primaryPdf"])
+
     db.session.commit()
     return get_contact_by_id(contact_id)
 
 
 def append_supplement_attachments(contact_id: str, files: list[dict]) -> dict | None:
     existing = db.session.execute(
-        text("SELECT id FROM contact_forms WHERE id = :id"),
+        text("SELECT id FROM contact_forms WHERE id = :id AND deleted_at IS NULL"),
         {"id": contact_id},
     ).first()
     if not existing:
@@ -631,6 +961,20 @@ def _apply_cancel_effects(
                 "cancelled_at": cancelled_at,
             },
         )
+        db.session.execute(
+            text(
+                """
+                UPDATE projects
+                SET status = :status, updated_at = :updated_at
+                WHERE project_no = :project_no
+                """
+            ),
+            {
+                "project_no": project_no,
+                "status": PROJECT_STATUS_CANCELLED,
+                "updated_at": cancelled_at,
+            },
+        )
         linked = db.session.execute(
             text("SELECT contact_form_id FROM contact_form_projects WHERE project_no = :project_no"),
             {"project_no": project_no},
@@ -661,7 +1005,7 @@ def _apply_cancel_effects(
 
 def create_child_contact(parent_id: str, payload: dict) -> dict | None:
     parent = db.session.execute(
-        text("SELECT * FROM contact_forms WHERE id = :id"),
+        text("SELECT * FROM contact_forms WHERE id = :id AND deleted_at IS NULL"),
         {"id": parent_id},
     ).first()
     if not parent:
@@ -669,7 +1013,10 @@ def create_child_contact(parent_id: str, payload: dict) -> dict | None:
 
     parent_row = _row_to_dict(parent)
     max_sort_row = db.session.execute(
-        text("SELECT COALESCE(MAX(sort_order), 0) AS max_sort FROM contact_forms WHERE root_id = :root_id"),
+        text(
+            "SELECT COALESCE(MAX(sort_order), 0) AS max_sort "
+            "FROM contact_forms WHERE root_id = :root_id AND deleted_at IS NULL"
+        ),
         {"root_id": parent_row["root_id"]},
     ).first()
     max_sort = int(max_sort_row.max_sort) if max_sort_row else 0
@@ -733,11 +1080,23 @@ def create_child_contact(parent_id: str, payload: dict) -> dict | None:
 
 def delete_contact(contact_id: str) -> bool:
     existing = db.session.execute(
-        text("SELECT id FROM contact_forms WHERE id = :id"),
+        text("SELECT id FROM contact_forms WHERE id = :id AND deleted_at IS NULL"),
         {"id": contact_id},
     ).first()
     if not existing:
         return False
-    db.session.execute(text("DELETE FROM contact_forms WHERE id = :id"), {"id": contact_id})
+
+    deleted_at = _now_local()
+    _soft_delete_contact_pdfs(contact_id, deleted_at)
+    db.session.execute(
+        text(
+            """
+            UPDATE contact_forms
+            SET deleted_at = :deleted_at, updated_at = :updated_at
+            WHERE id = :id
+            """
+        ),
+        {"id": contact_id, "deleted_at": deleted_at, "updated_at": deleted_at},
+    )
     db.session.commit()
     return True

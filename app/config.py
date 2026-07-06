@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 from pathlib import Path
 
 from steeltech_db.config import BaseConfig
@@ -15,6 +16,9 @@ class Config(BaseConfig):
 
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", SECRET_KEY)
+    JWT_ACCESS_TOKEN_EXPIRES = timedelta(
+        hours=int(os.getenv("JWT_ACCESS_TOKEN_HOURS", "8"))
+    )
 
     CORS_ORIGINS = [
         origin.strip()
@@ -25,9 +29,13 @@ class Config(BaseConfig):
     ]
 
     DEFAULT_LOGIN_PASSWORD = os.getenv("DEFAULT_LOGIN_PASSWORD", "123456")
-    CONTACT_PDF_STORAGE_ROOT = Path(
+
+    _contact_pdf_storage_root = Path(
         os.getenv(
             "CONTACT_PDF_STORAGE_ROOT",
             str(BASE_DIR / "datas" / "files" / "contact-pdfs"),
         )
     )
+    if not _contact_pdf_storage_root.is_absolute():
+        _contact_pdf_storage_root = (BASE_DIR / _contact_pdf_storage_root).resolve()
+    CONTACT_PDF_STORAGE_ROOT = _contact_pdf_storage_root

@@ -4,10 +4,10 @@ import os
 
 from flask import Blueprint, jsonify, request
 
-from app.services import folder_template_service, system_config_service
+from app.services import folder_template_service, path_search_service, system_config_service
 from app.services.folder_template_service import FolderTemplateError
 from app.utils.network_host import get_local_ipv4_addresses, list_host_drives
-from app.utils.paths import build_full_path, normalize_relative_path
+from app.utils.paths import build_full_path, normalize_access_path, normalize_relative_path
 
 system_bp = Blueprint("system", __name__)
 
@@ -54,10 +54,64 @@ def path_exists():
     if not path:
         return jsonify({"message": "路径不能为空"}), 400
     try:
-        exists = os.path.exists(path)
+        exists = os.path.exists(normalize_access_path(path))
     except OSError:
         exists = False
     return jsonify({"path": path, "exists": exists})
+
+
+@system_bp.get("/search-project-path")
+def search_project_path():
+    project_no = (request.args.get("projectNo") or "").strip()
+    if not project_no:
+        return jsonify({"message": "项目号不能为空"}), 400
+
+    relative_path = normalize_relative_path(request.args.get("relativePath", ""))
+    natures = [
+        item.strip()
+        for item in (request.args.get("natures") or "").split(",")
+        if item.strip() in {"design", "detail"}
+    ]
+    received_date = (request.args.get("receivedDate") or "").strip()
+    project_name = (request.args.get("projectName") or "").strip()
+    contact_form_ids = [
+        item.strip()
+        for item in (request.args.get("contactFormIds") or "").split(",")
+        if item.strip()
+    ]
+    is_jiagongdan_raw = (request.args.get("isJiagongdan") or "").strip().lower()
+    is_jiagongdan = (
+        True
+        if is_jiagongdan_raw in {"1", "true", "yes"}
+        else False
+        if is_jiagongdan_raw in {"0", "false", "no"}
+        else None
+    )
+    try:
+        matches = path_search_service.search_project_paths(
+            project_no,
+            relative_path,
+            natures or None,
+            received_date=received_date,
+            project_name=project_name,
+            contact_form_ids=contact_form_ids or None,
+            is_jiagongdan=is_jiagongdan,
+        )
+    except OSError as exc:
+        return jsonify({"message": str(exc) or "搜索路径失败"}), 500
+
+    return jsonify(
+        {
+            "projectNo": project_no,
+            "matches": [
+                {
+                    "relativePath": item["relativePath"],
+                    "fullPath": item["fullPath"],
+                }
+                for item in matches
+            ],
+        }
+    )
 
 
 @system_bp.get("/folder-templates")

@@ -39,8 +39,15 @@ def normalize_local_work_path_config(config: dict | LocalWorkPathConfig | None) 
     drive = normalize_drive(str(payload.get("drive", DEFAULT_LOCAL_WORK_PATH.drive)))
 
     path_patterns = normalize_path_patterns(payload.get("pathPatterns"))
+    suggest_path_on_mismatch = bool(payload.get("suggestPathOnMismatch", False))
 
-    return LocalWorkPathConfig(ip=ip, ips=ips, drive=drive, path_patterns=path_patterns)
+    return LocalWorkPathConfig(
+        ip=ip,
+        ips=ips,
+        drive=drive,
+        path_patterns=path_patterns,
+        suggest_path_on_mismatch=suggest_path_on_mismatch,
+    )
 
 
 def get_local_work_path_config() -> dict:

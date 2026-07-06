@@ -11,3 +11,6 @@ build/
 dist/
 venv/
 /.temp
+/datas/backups
+/datas/files/contact-pdfs
+/datas/files/path_template
