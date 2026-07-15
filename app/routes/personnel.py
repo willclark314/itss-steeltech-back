@@ -1,8 +1,19 @@
 from flask import Blueprint, jsonify, request
 
 from app.services import personnel_service
+from app.utils.route_permissions import register_read_write_guard
 
 personnel_bp = Blueprint("personnel", __name__)
+
+register_read_write_guard(
+    personnel_bp,
+    view_codes=("person:view",),
+    read_codes=(
+        "person:view",
+        "design-team-schedule:view",
+        "detail-team-schedule:view",
+    ),
+)
 
 
 @personnel_bp.get("")

@@ -9,8 +9,11 @@ from flask_jwt_extended import get_jwt, jwt_required
 
 from app.services import monthly_rest_service
 from app.services.auth_scope import is_jwt_admin
+from app.utils.route_permissions import register_any_permission_guard
 
 monthly_rest_bp = Blueprint("monthly_rest", __name__)
+
+register_any_permission_guard(monthly_rest_bp, "monthly-rest:view", "leave:view")
 
 
 def _get_personnel_id_from_token() -> Optional[str]:

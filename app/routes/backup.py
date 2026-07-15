@@ -5,9 +5,15 @@ from __future__ import annotations
 from flask import Blueprint, current_app, jsonify, request, send_file
 
 from app.services.backup_service import BackupService
+from app.utils.route_permissions import register_read_write_guard
 
 backup_bp = Blueprint("backup", __name__)
 service = BackupService()
+
+register_read_write_guard(
+    backup_bp,
+    view_codes=("system-settings:view",),
+)
 
 
 @backup_bp.route("/config", methods=["GET", "PUT"])

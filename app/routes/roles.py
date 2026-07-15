@@ -2,7 +2,14 @@ from flask import Blueprint, jsonify, request
 
 from app.services import role_service
 
+from app.utils.route_permissions import register_read_write_guard
+
 roles_bp = Blueprint("roles", __name__)
+
+register_read_write_guard(
+    roles_bp,
+    view_codes=("role:view",),
+)
 
 
 @roles_bp.get("")

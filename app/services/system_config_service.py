@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime
 
 from steeltech_db.defaults import (
     DEFAULT_LOCAL_WORK_PATH,
-    DEFAULT_PATH_PATTERNS,
     DEFAULT_SERVER_IP,
     SETTINGS_KEY,
     LocalWorkPathConfig,
-    normalize_drive,
+    normalize_archive_template_paths,
     normalize_ip_list,
     normalize_path_patterns,
 )
@@ -23,7 +21,6 @@ def normalize_local_work_path_config(config: dict | LocalWorkPathConfig | None) 
         return LocalWorkPathConfig(
             ip=DEFAULT_LOCAL_WORK_PATH.ip,
             ips=list(DEFAULT_LOCAL_WORK_PATH.ips or []),
-            drive=DEFAULT_LOCAL_WORK_PATH.drive,
         )
 
     if isinstance(config, LocalWorkPathConfig):
@@ -36,16 +33,16 @@ def normalize_local_work_path_config(config: dict | LocalWorkPathConfig | None) 
     )
     ip_candidate = str(payload.get("ip", ips[0])).strip()
     ip = ip_candidate if ip_candidate in ips else ips[0]
-    drive = normalize_drive(str(payload.get("drive", DEFAULT_LOCAL_WORK_PATH.drive)))
 
     path_patterns = normalize_path_patterns(payload.get("pathPatterns"))
+    archive_template_paths = normalize_archive_template_paths(payload.get("archiveTemplatePaths"))
     suggest_path_on_mismatch = bool(payload.get("suggestPathOnMismatch", False))
 
     return LocalWorkPathConfig(
         ip=ip,
         ips=ips,
-        drive=drive,
         path_patterns=path_patterns,
+        archive_template_paths=archive_template_paths,
         suggest_path_on_mismatch=suggest_path_on_mismatch,
     )
 
@@ -65,12 +62,6 @@ def save_local_work_path_config(payload: dict) -> dict:
     local_work_path = payload.get("localWorkPath")
     if not isinstance(local_work_path, dict):
         raise ValueError("请求体格式错误")
-
-    drive = str(local_work_path.get("drive", "")).strip()
-    if not drive:
-        raise ValueError("默认盘符不能为空")
-    if not re.fullmatch(r"[A-Za-z]", drive):
-        raise ValueError("盘符为单个字母")
 
     normalized = normalize_local_work_path_config(local_work_path).to_dict()
     row = SystemSetting.query.filter_by(key=SETTINGS_KEY).first()

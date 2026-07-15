@@ -8,8 +8,14 @@ from app.services import folder_template_service, path_search_service, system_co
 from app.services.folder_template_service import FolderTemplateError
 from app.utils.network_host import get_local_ipv4_addresses, list_host_drives
 from app.utils.paths import build_full_path, normalize_access_path, normalize_relative_path
+from app.utils.route_permissions import register_read_write_guard
 
 system_bp = Blueprint("system", __name__)
+
+register_read_write_guard(
+    system_bp,
+    view_codes=("system-settings:view",),
+)
 
 
 def _normalize_full_path(path: str) -> str:

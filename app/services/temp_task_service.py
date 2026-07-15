@@ -6,15 +6,19 @@ import uuid
 from datetime import datetime
 
 from flask_jwt_extended import get_jwt
-from sqlalchemy import or_, text
+from sqlalchemy import or_
 
 from app.services.auth_scope import is_jwt_admin
 from steeltech_db.extensions import db
-from steeltech_db.models import Personnel, TempTask, TempTaskPersonnel
+from steeltech_db.models import Personnel, Project, TempTask, TempTaskPersonnel
 
 
 def _now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 def _get_editor_personnel_id() -> str | None:
@@ -49,16 +53,22 @@ def _can_edit_task(task: TempTask) -> bool:
     return associated is not None
 
 
-def _validate_datetime(value: str | None, *, field_name: str, required: bool = False) -> str | None:
+def _normalize_date(value: str | None) -> str:
+    """兼容历史 YYYY-MM-DD HH:mm:ss，统一落地 YYYY-MM-DD。"""
     normalized = (value or "").strip()
+    return normalized[:10] if normalized else ""
+
+
+def _validate_date(value: str | None, *, field_name: str, required: bool = False) -> str | None:
+    normalized = _normalize_date(value)
     if not normalized:
         if required:
             return f"{field_name}不能为空"
         return None
     try:
-        datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S")
+        datetime.strptime(normalized, "%Y-%m-%d")
     except ValueError:
-        return f"{field_name}格式无效，应为 YYYY-MM-DD HH:mm:ss"
+        return f"{field_name}格式无效，应为 YYYY-MM-DD"
     return None
 
 
@@ -69,50 +79,42 @@ def _normalize_personnel_ids(personnel_ids: list[str] | None) -> list[str]:
 def _validate_personnel_ids(personnel_ids: list[str]) -> str | None:
     if not personnel_ids:
         return "至少关联一名人员"
-    placeholders = ", ".join(f":p{i}" for i in range(len(personnel_ids)))
-    params = {f"p{i}": value for i, value in enumerate(personnel_ids)}
-    rows = db.session.execute(
-        text(f"SELECT id FROM personnel WHERE id IN ({placeholders})"),
-        params,
-    ).all()
-    found = {row.id for row in rows}
+    found = {p.id for p in Personnel.query.filter(Personnel.id.in_(personnel_ids)).all()}
     missing = [item for item in personnel_ids if item not in found]
     if missing:
         return "关联人员不存在"
     return None
 
 
+def _normalize_project_no(value: str | None) -> str:
+    return (value or "").strip()
+
+
+def _project_exists(project_no: str) -> bool:
+    if not project_no:
+        return False
+    return Project.query.filter_by(project_no=project_no).first() is not None
+
+
 def _get_personnel_names(personnel_ids: list[str]) -> dict[str, str]:
     if not personnel_ids:
         return {}
-    placeholders = ", ".join(f":p{i}" for i in range(len(personnel_ids)))
-    params = {f"p{i}": value for i, value in enumerate(personnel_ids)}
-    rows = db.session.execute(
-        text(f"SELECT id, name FROM personnel WHERE id IN ({placeholders})"),
-        params,
-    ).all()
-    return {row.id: row.name for row in rows}
+    personnel = Personnel.query.filter(Personnel.id.in_(personnel_ids)).all()
+    return {p.id: p.name for p in personnel}
 
 
 def _get_task_personnel_map(task_ids: list[str]) -> dict[str, list[str]]:
     if not task_ids:
         return {}
-    placeholders = ", ".join(f":t{i}" for i in range(len(task_ids)))
-    params = {f"t{i}": value for i, value in enumerate(task_ids)}
-    rows = db.session.execute(
-        text(
-            f"""
-            SELECT temp_task_id, personnel_id
-            FROM temp_task_personnel
-            WHERE temp_task_id IN ({placeholders})
-            ORDER BY personnel_id
-            """
-        ),
-        params,
-    ).all()
+    links = (
+        TempTaskPersonnel.query
+        .filter(TempTaskPersonnel.temp_task_id.in_(task_ids))
+        .order_by(TempTaskPersonnel.personnel_id)
+        .all()
+    )
     result: dict[str, list[str]] = {task_id: [] for task_id in task_ids}
-    for row in rows:
-        result.setdefault(row.temp_task_id, []).append(row.personnel_id)
+    for link in links:
+        result.setdefault(link.temp_task_id, []).append(link.personnel_id)
     return result
 
 
@@ -164,24 +166,31 @@ def create_temp_task(data: dict) -> tuple[dict | None, str | None, int]:
     if not name:
         return None, "任务名称不能为空", 400
 
-    start_time = str(data.get("startTime", "")).strip() or _now_str()
-    completed_at = str(data.get("completedAt", "")).strip()
+    start_time = _normalize_date(str(data.get("startTime", "")).strip() or _today_str())
+    completed_at = _normalize_date(str(data.get("completedAt", "")).strip())
     description = str(data.get("description", "")).strip()
     personnel_ids = _normalize_personnel_ids(data.get("personnelIds"))
+    is_related_project = bool(data.get("isRelatedProject"))
+    related_project_no = _normalize_project_no(data.get("relatedProjectNo"))
     if editor_id not in personnel_ids:
         personnel_ids.insert(0, editor_id)
 
-    for field_name, value, required in (
-        ("开始时间", start_time, True),
-        ("完成时间", completed_at, False),
-    ):
-        error = _validate_datetime(value, field_name=field_name, required=required)
+    for field_name, value, required in (("开始时间", start_time, True), ("完成时间", completed_at, False)):
+        error = _validate_date(value, field_name=field_name, required=required)
         if error:
             return None, error, 400
 
     personnel_error = _validate_personnel_ids(personnel_ids)
     if personnel_error:
         return None, personnel_error, 400
+
+    if is_related_project:
+        if not related_project_no:
+            return None, "关联项目号不能为空", 400
+        if not _project_exists(related_project_no):
+            return None, "关联项目不存在", 400
+    else:
+        related_project_no = ""
 
     now = _now_str()
     task_id = uuid.uuid4().hex[:12]
@@ -191,6 +200,8 @@ def create_temp_task(data: dict) -> tuple[dict | None, str | None, int]:
         description=description,
         start_time=start_time,
         completed_at=completed_at or None,
+        is_related_project=1 if is_related_project else 0,
+        related_project_no=related_project_no or None,
         created_by=editor_id,
         created_at=now,
         updated_at=now,
@@ -221,10 +232,12 @@ def update_temp_task(task_id: str, data: dict) -> tuple[dict | None, str | None,
     if not name:
         return None, "任务名称不能为空", 400
 
-    start_time = str(data.get("startTime", task.start_time)).strip()
-    completed_at = str(data.get("completedAt", task.completed_at or "")).strip()
+    start_time = _normalize_date(str(data.get("startTime", task.start_time)).strip())
+    completed_at = _normalize_date(str(data.get("completedAt", task.completed_at or "")).strip())
     description = str(data.get("description", task.description or "")).strip()
     personnel_ids = _normalize_personnel_ids(data.get("personnelIds"))
+    is_related_project = bool(data.get("isRelatedProject", bool(task.is_related_project)))
+    related_project_no = _normalize_project_no(data.get("relatedProjectNo", task.related_project_no or ""))
     if not personnel_ids:
         personnel_ids = [
             row.personnel_id
@@ -233,11 +246,8 @@ def update_temp_task(task_id: str, data: dict) -> tuple[dict | None, str | None,
     if task.created_by not in personnel_ids:
         personnel_ids.insert(0, task.created_by)
 
-    for field_name, value, required in (
-        ("开始时间", start_time, True),
-        ("完成时间", completed_at, False),
-    ):
-        error = _validate_datetime(value, field_name=field_name, required=required)
+    for field_name, value, required in (("开始时间", start_time, True), ("完成时间", completed_at, False)):
+        error = _validate_date(value, field_name=field_name, required=required)
         if error:
             return None, error, 400
 
@@ -245,10 +255,20 @@ def update_temp_task(task_id: str, data: dict) -> tuple[dict | None, str | None,
     if personnel_error:
         return None, personnel_error, 400
 
+    if is_related_project:
+        if not related_project_no:
+            return None, "关联项目号不能为空", 400
+        if not _project_exists(related_project_no):
+            return None, "关联项目不存在", 400
+    else:
+        related_project_no = ""
+
     task.name = name
     task.description = description
     task.start_time = start_time
     task.completed_at = completed_at or None
+    task.is_related_project = 1 if is_related_project else 0
+    task.related_project_no = related_project_no or None
     task.updated_at = _now_str()
 
     TempTaskPersonnel.query.filter_by(temp_task_id=task.id).delete()

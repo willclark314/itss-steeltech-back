@@ -9,8 +9,11 @@ from flask_jwt_extended import jwt_required
 
 from app.services import leave_service
 from app.services.auth_scope import is_jwt_admin
+from app.utils.route_permissions import register_any_permission_guard
 
 leave_bp = Blueprint("leave", __name__)
+
+register_any_permission_guard(leave_bp, "leave:view")
 
 
 def _get_personnel_id_from_token() -> Optional[str]:

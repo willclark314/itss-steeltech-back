@@ -2,8 +2,14 @@ from flask import Blueprint, jsonify, request
 
 from app.services import contact_service, tag_service
 from app.utils.pagination import parse_list_page_query
+from app.utils.route_permissions import register_read_write_guard
 
 contacts_bp = Blueprint("contacts", __name__)
+
+register_read_write_guard(
+    contacts_bp,
+    view_codes=("contact-browse:view", "contact:view", "my:view"),
+)
 
 
 @contacts_bp.get("")
@@ -12,7 +18,6 @@ def list_contacts():
     load_all = request.args.get("all") == "true"
     result = contact_service.list_contacts(
         keyword=request.args.get("keyword", ""),
-        status=request.args.get("status", ""),
         assigned_personnel_id=request.args.get("assignedPersonnelId", ""),
         tag_ids=tag_service.parse_tags_param(request.args.get("tags", "")),
         page_query=page_query,
@@ -77,7 +82,7 @@ def append_attachments(contact_id: str):
     payload = request.get_json(silent=True) or {}
     files = payload.get("files") or []
     if not files:
-        return jsonify({"message": "请提供 PDF 附件"}), 400
+        return jsonify({"message": "请提供附件"}), 400
     try:
         contact = contact_service.append_supplement_attachments(contact_id, files)
     except ValueError as exc:

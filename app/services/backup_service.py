@@ -157,6 +157,35 @@ class BackupService:
         return archive_name
 
     @staticmethod
+    def _find_mysqldump() -> str:
+        """查找 mysqldump 可执行文件路径。"""
+        import shutil as _shutil
+
+        # 先尝试 PATH 中的
+        found = _shutil.which("mysqldump")
+        if found:
+            return found
+
+        # Windows 常见路径
+        candidates = [
+            r"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqldump.exe",
+            r"C:\Program Files\MySQL\MySQL Server 8.4\bin\mysqldump.exe",
+            r"C:\Program Files\MySQL\MySQL Server 9.0\bin\mysqldump.exe",
+        ]
+        for candidate in candidates:
+            if Path(candidate).exists():
+                return candidate
+
+        # Linux/Docker 常见路径
+        for candidate in ["/usr/bin/mysqldump", "/usr/local/bin/mysqldump"]:
+            if Path(candidate).exists():
+                return candidate
+
+        raise FileNotFoundError(
+            "未找到 mysqldump。请安装 MySQL 客户端工具或将其加入 PATH。"
+        )
+
+    @staticmethod
     def _dump_mysql(app: Flask, backup_path: Path) -> None:
         """使用 mysqldump 导出 MySQL 数据库。"""
         from urllib.parse import urlparse
@@ -169,8 +198,10 @@ class BackupService:
         password = parsed.password or ""
         database = parsed.path.lstrip("/")
 
+        mysqldump = BackupService._find_mysqldump()
+
         cmd = [
-            "mysqldump",
+            mysqldump,
             f"--host={host}",
             f"--port={port}",
             f"--user={user}",

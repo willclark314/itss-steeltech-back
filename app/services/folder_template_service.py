@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import shutil
 from datetime import datetime
@@ -8,46 +7,75 @@ from pathlib import Path
 
 from app.config import Config
 from app.services.system_config_service import get_local_work_path_config
-from app.utils.paths import build_full_path_with_ip, normalize_relative_path
-from steeltech_db.defaults import normalize_drive
+from app.utils.paths import build_full_path_with_ip, normalize_access_path, normalize_relative_path
 
-TEMPLATE_FILE = Config.BASE_DIR / "datas" / "project_folder_templates.json"
 FILES_DIR = Config.BASE_DIR / "datas" / "files"
 DIRECTORY_README_TEMPLATE_FILE = FILES_DIR / "directory_readme.template.txt"
 PACK_README_TEMPLATE_FILE = FILES_DIR / "pack_readme.template.txt"
 IP_PATTERN = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
 MAIN_PROJECT_DIR_MARKERS = ("工程编号", "项目名称")
 SPECIAL_TEMPLATE_MARKERS = ("变更通知单", "楼承板排版图")
+FOLDER_NAME_NOISE_PATTERNS = (
+    re.compile(r"^（空样板[!！]勿剪切）\s*"),
+    re.compile(r"\s*【待安排@@】\(需排瓦&不排瓦\)(?:\(GJGJSK-[\d.]+版\))?"),
+)
+
+ARCHIVE_COPY_PROFILES: dict[str, dict] = {
+    "design": {
+        "label": "设计组项目目录",
+        "nameTokens": {},
+        "preserveSourceRoot": False,
+        "directoryReadme": "目录说明.txt",
+        "packReadme": "打包说明.txt",
+        "packReadmePaths": [".", "06 归档"],
+    },
+    "detail": {
+        "label": "细化组项目目录",
+        "nameTokens": {
+            "工程编号": "{projectNo}",
+            "项目名称": "{projectName}",
+            "工程名称": "{projectName}",
+        },
+        "createInnerProjectFolder": True,
+        "unwrapMainProjectDir": True,
+        "directoryReadme": "目录说明.txt",
+        "packReadme": "打包说明.txt",
+        "packReadmePaths": [".", "3-加工图及清单/8-清单"],
+    },
+    "detailJiagongdan": {
+        "label": "细化加工单项目目录",
+        "nameTokens": {
+            "工程编号": "{projectNo}",
+            "项目名称": "{projectName}",
+            "工程名称": "{projectName}",
+        },
+        "createInnerProjectFolder": True,
+        "unwrapMainProjectDir": True,
+        "directoryReadme": "目录说明.txt",
+        "packReadme": "打包说明.txt",
+        "packReadmePaths": [".", "3-加工图及清单/8-清单"],
+    },
+}
+
+ARCHIVE_PROFILE_LABELS = {
+    "design": "设计归档模板",
+    "detail": "细化归档模板",
+    "detailJiagongdan": "细化加工单归档模板",
+}
 
 
 class FolderTemplateError(ValueError):
     pass
 
 
-def _load_templates() -> dict[str, dict]:
-    if not TEMPLATE_FILE.exists():
-        raise FolderTemplateError("模板配置文件不存在")
-
-    try:
-        payload = json.loads(TEMPLATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise FolderTemplateError("模板配置文件格式错误") from exc
-
-    if not isinstance(payload, dict):
-        raise FolderTemplateError("模板配置文件格式错误")
-    return payload
-
-
 def list_folder_templates() -> list[dict]:
-    templates = _load_templates()
     return [
         {
             "key": key,
-            "name": str(item.get("name") or key),
-            "description": str(item.get("description") or ""),
+            "name": str(profile.get("label") or key),
+            "description": f"从全局配置的{ARCHIVE_PROFILE_LABELS.get(key, key)}路径复制",
         }
-        for key, item in templates.items()
-        if isinstance(item, dict)
+        for key, profile in ARCHIVE_COPY_PROFILES.items()
     ]
 
 
@@ -72,7 +100,6 @@ def _validate_relative_path(path: str) -> str:
 def resolve_target_full_path(
     path: str,
     ip: str | None = None,
-    drive: str | None = None,
 ) -> str:
     trimmed = (path or "").strip()
     if not trimmed:
@@ -92,9 +119,15 @@ def resolve_target_full_path(
 
     config = get_local_work_path_config()
     target_ip = _validate_ip(ip or str(config.get("ip", "")))
-    target_drive = normalize_drive(str(drive or config.get("drive", "F")))
     relative_path = _validate_relative_path(trimmed)
-    return build_full_path_with_ip(relative_path, target_ip, target_drive)
+    return build_full_path_with_ip(relative_path, target_ip)
+
+
+def _sanitize_folder_name(name: str) -> str:
+    result = str(name or "").strip()
+    for pattern in FOLDER_NAME_NOISE_PATTERNS:
+        result = pattern.sub("", result)
+    return result.strip().rstrip("/\\")
 
 
 def _render_text(value: str, variables: dict[str, str]) -> str:
@@ -121,6 +154,8 @@ def _build_variables(payload: dict | None) -> dict[str, str]:
         if value is not None:
             defaults[key] = str(value).strip()
 
+    defaults["projectName"] = _sanitize_folder_name(defaults["projectName"])
+
     for key, value in payload.items():
         if key in defaults or value is None:
             continue
@@ -132,6 +167,8 @@ def _build_variables(payload: dict | None) -> dict[str, str]:
             defaults["projectFolder"] = f"{project_no_digits}#{defaults['projectName']}"
         else:
             defaults["projectFolder"] = project_no_digits
+    else:
+        defaults["projectFolder"] = _sanitize_folder_name(defaults["projectFolder"])
 
     return defaults
 
@@ -148,13 +185,37 @@ def _translate_name(name: str, variables: dict[str, str], name_tokens: dict[str,
     if name_tokens:
         for token, pattern in name_tokens.items():
             rendered = rendered.replace(token, _render_text(str(pattern), variables))
-    return _render_text(rendered, variables)
+    return _sanitize_folder_name(_render_text(rendered, variables))
 
 
 def _is_main_project_dir(name: str) -> bool:
     if any(marker in name for marker in SPECIAL_TEMPLATE_MARKERS):
         return False
     return all(marker in name for marker in MAIN_PROJECT_DIR_MARKERS)
+
+
+def _resolve_effective_template_source(source_root: Path) -> Path:
+    """定位模板主项目目录：跳过变更通知单、楼承板排版图，并展开套娃样板层。"""
+    current = source_root
+    while current.is_dir():
+        children = sorted(
+            [item for item in current.iterdir() if item.is_dir()],
+            key=lambda item: item.name.lower(),
+        )
+        if not children:
+            break
+
+        main_dirs = [item for item in children if _is_main_project_dir(item.name)]
+        if len(main_dirs) == 1:
+            current = main_dirs[0]
+            continue
+
+        if len(children) == 1 and _is_main_project_dir(children[0].name):
+            current = children[0]
+            continue
+
+        break
+    return current
 
 
 def _build_directory_tree(root: Path, prefix: str = "") -> str:
@@ -370,9 +431,40 @@ def _copy_source_entry(
     _copy_file(source, target, skip_existing, created_files, skipped_files)
 
 
-def _generate_from_source(
-    template: dict,
+def _is_jiagongdan(variables: dict[str, str]) -> bool:
+    return str(variables.get("isJiagongdan") or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _resolve_archive_profile_key(template_key: str, is_jiagongdan: bool) -> str:
+    normalized = template_key.strip()
+    if normalized == "design":
+        return "design"
+    if normalized == "detailJiagongdan":
+        return "detailJiagongdan"
+    if normalized == "detail" and is_jiagongdan:
+        return "detailJiagongdan"
+    return "detail"
+
+
+def _resolve_archive_template_relative_path(config: dict, profile_key: str) -> str:
+    paths = config.get("archiveTemplatePaths")
+    if not isinstance(paths, dict):
+        return ""
+    return normalize_relative_path(str(paths.get(profile_key) or "").strip())
+
+
+def _build_inner_project_folder_name(variables: dict[str, str]) -> str:
+    project_no = str(variables.get("projectNo") or "").strip()
+    project_name = _sanitize_folder_name(str(variables.get("projectName") or ""))
+    if project_name:
+        return f"{project_no}#{project_name}"
+    return project_no
+
+
+def _generate_from_archive_template(
+    source_root: Path,
     project_root: Path,
+    profile: dict,
     variables: dict[str, str],
     skip_existing: bool,
     created_dirs: list[str],
@@ -380,58 +472,40 @@ def _generate_from_source(
     created_files: list[str],
     skipped_files: list[str],
 ) -> None:
-    source_dir = str(template.get("sourceDir") or "").strip()
-    if not source_dir:
-        raise FolderTemplateError("模板未配置 sourceDir")
-
-    source_base = FILES_DIR / source_dir.replace("/", "\\").strip("\\")
-    source_root_name = str(template.get("sourceRoot") or "").strip()
-    source_root_jiagongdan = str(template.get("sourceRootJiagongdan") or "").strip()
-    is_jiagongdan = str(variables.get("isJiagongdan") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "y",
+    name_tokens = profile.get("nameTokens") if isinstance(profile.get("nameTokens"), dict) else {}
+    effective_source = _resolve_effective_template_source(source_root)
+    pseudo_template = {
+        "nameTokens": name_tokens,
+        "preserveSourceRoot": False,
+        "unwrapMainProjectDir": bool(profile.get("unwrapMainProjectDir")),
+        "directoryReadme": profile.get("directoryReadme"),
+        "packReadme": profile.get("packReadme"),
+        "packReadmePaths": profile.get("packReadmePaths"),
     }
 
-    selected_root_name = source_root_jiagongdan if (is_jiagongdan and source_root_jiagongdan) else source_root_name
-    source_root = source_base / selected_root_name if selected_root_name else source_base
+    if bool(profile.get("createInnerProjectFolder")):
+        inner_name = _build_inner_project_folder_name(variables)
+        if not inner_name:
+            raise FolderTemplateError("无法生成内层项目文件夹名称")
+        managed_root = project_root / inner_name
+        _ensure_directory(managed_root, skip_existing, created_dirs, skipped_dirs)
+        copy_target = managed_root
+    else:
+        managed_root = project_root
+        copy_target = project_root
 
-    if not source_root.exists() or not source_root.is_dir():
-        raise FolderTemplateError(f"模板源目录不存在: {source_root}")
-
-    preserve_source_root = bool(template.get("preserveSourceRoot"))
-    managed_root = project_root
-    if preserve_source_root:
-        managed_root = project_root / _translate_name(
-            source_root.name,
-            variables,
-            template.get("nameTokens") if isinstance(template.get("nameTokens"), dict) else {},
-        )
+    for child in sorted(effective_source.iterdir(), key=lambda item: item.name.lower()):
         _copy_source_entry(
-            source_root,
-            project_root,
+            child,
+            copy_target,
             variables,
-            template,
+            pseudo_template,
             skip_existing,
             created_dirs,
             skipped_dirs,
             created_files,
             skipped_files,
         )
-    else:
-        for child in sorted(source_root.iterdir(), key=lambda item: item.name.lower()):
-            _copy_source_entry(
-                child,
-                project_root,
-                variables,
-                template,
-                skip_existing,
-                created_dirs,
-                skipped_dirs,
-                created_files,
-                skipped_files,
-            )
 
     managed_dirs = [path for path in managed_root.rglob("*") if path.is_dir()]
     managed_dirs.append(managed_root)
@@ -442,7 +516,7 @@ def _generate_from_source(
             directory,
             managed_root,
             variables,
-            template,
+            pseudo_template,
             skip_existing,
             created_files,
             skipped_files,
@@ -451,102 +525,11 @@ def _generate_from_source(
     _write_pack_readme_files(
         managed_root,
         variables,
-        template,
+        pseudo_template,
         skip_existing,
         created_files,
         skipped_files,
     )
-
-
-def _generate_from_directories(
-    template: dict,
-    project_root: Path,
-    variables: dict[str, str],
-    directories: list[str],
-    files: list[dict],
-    skip_existing: bool,
-    created_dirs: list[str],
-    skipped_dirs: list[str],
-    created_files: list[str],
-    skipped_files: list[str],
-) -> None:
-    for directory in directories:
-        rendered_name = _render_text(directory, variables)
-        target = project_root / rendered_name
-        _ensure_directory(target, skip_existing, created_dirs, skipped_dirs)
-
-    for file_item in files:
-        rendered_path = _render_text(file_item["path"], variables)
-        target = project_root / rendered_path
-        content = _render_text(file_item["content"], variables)
-        _write_text_file(target, content, skip_existing, created_files, skipped_files)
-
-    managed_dirs = [path for path in project_root.rglob("*") if path.is_dir()]
-    managed_dirs.append(project_root)
-    managed_dirs.sort(key=lambda path: len(path.parts))
-
-    for directory in managed_dirs:
-        _write_directory_readme(
-            directory,
-            project_root,
-            variables,
-            template,
-            skip_existing,
-            created_files,
-            skipped_files,
-        )
-
-    _write_pack_readme_files(
-        project_root,
-        variables,
-        template,
-        skip_existing,
-        created_files,
-        skipped_files,
-    )
-
-
-def _validate_template_item(template_key: str, template: dict) -> tuple[list[str], list[dict]]:
-    if template.get("sourceDir"):
-        return [], []
-
-    directories = template.get("directories")
-    files = template.get("files")
-
-    if not isinstance(directories, list) or not directories:
-        raise FolderTemplateError(f"模板 {template_key} 未配置目录")
-
-    normalized_dirs: list[str] = []
-    for item in directories:
-        name = str(item).strip().replace("/", "\\").strip("\\")
-        if not name:
-            raise FolderTemplateError(f"模板 {template_key} 存在空目录名")
-        if ".." in name.split("\\"):
-            raise FolderTemplateError(f"模板 {template_key} 目录名不能包含 ..")
-        normalized_dirs.append(name)
-
-    normalized_files: list[dict] = []
-    if files is None:
-        return normalized_dirs, normalized_files
-    if not isinstance(files, list):
-        raise FolderTemplateError(f"模板 {template_key} 文件配置格式错误")
-
-    for item in files:
-        if not isinstance(item, dict):
-            raise FolderTemplateError(f"模板 {template_key} 文件配置格式错误")
-        relative_path = str(item.get("path", "")).strip().replace("/", "\\").strip("\\")
-        if not relative_path:
-            raise FolderTemplateError(f"模板 {template_key} 存在空文件路径")
-        if ".." in relative_path.split("\\"):
-            raise FolderTemplateError(f"模板 {template_key} 文件路径不能包含 ..")
-        normalized_files.append(
-            {
-                "path": relative_path,
-                "content": str(item.get("content", "")),
-            }
-        )
-
-    return normalized_dirs, normalized_files
 
 
 def generate_folder_structure(payload: dict) -> dict:
@@ -554,15 +537,9 @@ def generate_folder_structure(payload: dict) -> dict:
     if not template_key:
         raise FolderTemplateError("模板不能为空")
 
-    templates = _load_templates()
-    template = templates.get(template_key)
-    if not isinstance(template, dict):
-        raise FolderTemplateError(f"未找到模板: {template_key}")
-
     full_path = resolve_target_full_path(
         str(payload.get("path") or ""),
         ip=str(payload.get("ip") or "").strip() or None,
-        drive=str(payload.get("drive") or "").strip() or None,
     )
     skip_existing = payload.get("skipExisting")
     if skip_existing is None:
@@ -570,13 +547,31 @@ def generate_folder_structure(payload: dict) -> dict:
     skip_existing = bool(skip_existing)
 
     variables = _build_variables(payload.get("variables") if isinstance(payload.get("variables"), dict) else None)
+    profile_key = _resolve_archive_profile_key(template_key, _is_jiagongdan(variables))
+    profile = ARCHIVE_COPY_PROFILES.get(profile_key)
+    if not isinstance(profile, dict):
+        raise FolderTemplateError(f"未找到模板: {template_key}")
+
+    config = get_local_work_path_config()
+    template_relative_path = _resolve_archive_template_relative_path(config, profile_key)
+    if not template_relative_path:
+        label = ARCHIVE_PROFILE_LABELS.get(profile_key, profile_key)
+        raise FolderTemplateError(f"未配置{label}路径，请先在全局配置中设置")
+
+    template_full_path = resolve_target_full_path(
+        template_relative_path,
+        ip=str(payload.get("ip") or "").strip() or None,
+    )
+    source_root = Path(normalize_access_path(template_full_path))
+    if not source_root.exists() or not source_root.is_dir():
+        raise FolderTemplateError(f"归档模板目录不存在: {template_full_path}")
 
     created_dirs: list[str] = []
     skipped_dirs: list[str] = []
     created_files: list[str] = []
     skipped_files: list[str] = []
 
-    root = Path(full_path)
+    root = Path(normalize_access_path(full_path))
     if root.exists() and not root.is_dir():
         raise FolderTemplateError("目标路径已存在且不是文件夹")
 
@@ -585,36 +580,23 @@ def generate_folder_structure(payload: dict) -> dict:
     except OSError as exc:
         raise FolderTemplateError(f"创建目标目录失败: {exc}") from exc
 
-    if template.get("sourceDir"):
-        _generate_from_source(
-            template,
-            root,
-            variables,
-            skip_existing,
-            created_dirs,
-            skipped_dirs,
-            created_files,
-            skipped_files,
-        )
-    else:
-        directories, files = _validate_template_item(template_key, template)
-        _generate_from_directories(
-            template,
-            root,
-            variables,
-            directories,
-            files,
-            skip_existing,
-            created_dirs,
-            skipped_dirs,
-            created_files,
-            skipped_files,
-        )
+    _generate_from_archive_template(
+        source_root,
+        root,
+        profile,
+        variables,
+        skip_existing,
+        created_dirs,
+        skipped_dirs,
+        created_files,
+        skipped_files,
+    )
 
     return {
         "ok": True,
-        "template": template_key,
+        "template": profile_key,
         "fullPath": full_path,
+        "templatePath": template_full_path,
         "createdDirs": created_dirs,
         "skippedDirs": skipped_dirs,
         "createdFiles": created_files,

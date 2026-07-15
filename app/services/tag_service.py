@@ -2,45 +2,35 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import text
-
 from steeltech_db.extensions import db
+from steeltech_db.models.tag import ContactFormTag, ProjectTag, Tag
 
 
-def _map_tag_row(row) -> dict:
-    return {"id": row.id, "name": row.name}
+def _tag_to_dict(tag: Tag) -> dict:
+    return {"id": tag.id, "name": tag.name}
 
 
 def list_tags() -> list[dict]:
-    rows = db.session.execute(text("SELECT id, name FROM tags ORDER BY name COLLATE NOCASE")).all()
-    return [_map_tag_row(row) for row in rows]
+    tags = Tag.query.order_by(db.func.lower(Tag.name)).all()
+    return [_tag_to_dict(t) for t in tags]
 
 
 def get_tag_by_id(tag_id: str) -> dict | None:
-    row = db.session.execute(
-        text("SELECT id, name FROM tags WHERE id = :id"),
-        {"id": tag_id},
-    ).first()
-    return _map_tag_row(row) if row else None
+    tag = Tag.query.get(tag_id)
+    return _tag_to_dict(tag) if tag else None
 
 
 def create_tag(name: str) -> dict:
     normalized = name.strip()
     if not normalized:
         raise ValueError("标签名称不能为空")
-    existing = db.session.execute(
-        text("SELECT id, name FROM tags WHERE name = :name"),
-        {"name": normalized},
-    ).first()
+    existing = Tag.query.filter_by(name=normalized).first()
     if existing:
-        return _map_tag_row(existing)
-    tag_id = uuid.uuid4().hex[:12]
-    db.session.execute(
-        text("INSERT INTO tags (id, name) VALUES (:id, :name)"),
-        {"id": tag_id, "name": normalized},
-    )
+        return _tag_to_dict(existing)
+    tag = Tag(id=uuid.uuid4().hex[:12], name=normalized)
+    db.session.add(tag)
     db.session.commit()
-    return {"id": tag_id, "name": normalized}
+    return _tag_to_dict(tag)
 
 
 def parse_tags_param(raw: str) -> list[str]:
@@ -51,13 +41,7 @@ def normalize_tag_ids(tag_ids: list[str] | None) -> tuple[list[str], str | None]
     unique = list(dict.fromkeys(item.strip() for item in (tag_ids or []) if item and item.strip()))
     if not unique:
         return [], None
-    placeholders = ", ".join(f":t{i}" for i in range(len(unique)))
-    params = {f"t{i}": value for i, value in enumerate(unique)}
-    rows = db.session.execute(
-        text(f"SELECT id FROM tags WHERE id IN ({placeholders})"),
-        params,
-    ).all()
-    found = {row.id for row in rows}
+    found = {t.id for t in Tag.query.filter(Tag.id.in_(unique)).all()}
     missing = [item for item in unique if item not in found]
     if missing:
         return [], "标签不存在"
@@ -65,54 +49,37 @@ def normalize_tag_ids(tag_ids: list[str] | None) -> tuple[list[str], str | None]
 
 
 def get_project_tags(project_no: str) -> list[dict]:
-    rows = db.session.execute(
-        text(
-            """
-            SELECT t.id, t.name
-            FROM project_tags pt
-            INNER JOIN tags t ON t.id = pt.tag_id
-            WHERE pt.project_no = :project_no
-            ORDER BY t.name COLLATE NOCASE
-            """
-        ),
-        {"project_no": project_no},
-    ).all()
-    return [_map_tag_row(row) for row in rows]
+    tags = (
+        db.session.query(Tag)
+        .join(ProjectTag, ProjectTag.tag_id == Tag.id)
+        .filter(ProjectTag.project_no == project_no)
+        .order_by(db.func.lower(Tag.name))
+        .all()
+    )
+    return [_tag_to_dict(t) for t in tags]
 
 
 def get_contact_tags(contact_form_id: str) -> list[dict]:
-    rows = db.session.execute(
-        text(
-            """
-            SELECT t.id, t.name
-            FROM contact_form_tags cft
-            INNER JOIN tags t ON t.id = cft.tag_id
-            WHERE cft.contact_form_id = :contact_form_id
-            ORDER BY t.name COLLATE NOCASE
-            """
-        ),
-        {"contact_form_id": contact_form_id},
-    ).all()
-    return [_map_tag_row(row) for row in rows]
+    tags = (
+        db.session.query(Tag)
+        .join(ContactFormTag, ContactFormTag.tag_id == Tag.id)
+        .filter(ContactFormTag.contact_form_id == contact_form_id)
+        .order_by(db.func.lower(Tag.name))
+        .all()
+    )
+    return [_tag_to_dict(t) for t in tags]
 
 
 def get_project_tags_map(project_nos: list[str]) -> dict[str, list[dict]]:
     if not project_nos:
         return {}
-    placeholders = ", ".join(f":p{i}" for i in range(len(project_nos)))
-    params = {f"p{i}": value for i, value in enumerate(project_nos)}
-    rows = db.session.execute(
-        text(
-            f"""
-            SELECT pt.project_no, t.id, t.name
-            FROM project_tags pt
-            INNER JOIN tags t ON t.id = pt.tag_id
-            WHERE pt.project_no IN ({placeholders})
-            ORDER BY t.name COLLATE NOCASE
-            """
-        ),
-        params,
-    ).all()
+    rows = (
+        db.session.query(ProjectTag.project_no, Tag.id, Tag.name)
+        .join(Tag, Tag.id == ProjectTag.tag_id)
+        .filter(ProjectTag.project_no.in_(project_nos))
+        .order_by(db.func.lower(Tag.name))
+        .all()
+    )
     result: dict[str, list[dict]] = {project_no: [] for project_no in project_nos}
     for row in rows:
         result.setdefault(row.project_no, []).append({"id": row.id, "name": row.name})
@@ -122,20 +89,13 @@ def get_project_tags_map(project_nos: list[str]) -> dict[str, list[dict]]:
 def get_contact_tags_map(contact_ids: list[str]) -> dict[str, list[dict]]:
     if not contact_ids:
         return {}
-    placeholders = ", ".join(f":c{i}" for i in range(len(contact_ids)))
-    params = {f"c{i}": value for i, value in enumerate(contact_ids)}
-    rows = db.session.execute(
-        text(
-            f"""
-            SELECT cft.contact_form_id, t.id, t.name
-            FROM contact_form_tags cft
-            INNER JOIN tags t ON t.id = cft.tag_id
-            WHERE cft.contact_form_id IN ({placeholders})
-            ORDER BY t.name COLLATE NOCASE
-            """
-        ),
-        params,
-    ).all()
+    rows = (
+        db.session.query(ContactFormTag.contact_form_id, Tag.id, Tag.name)
+        .join(Tag, Tag.id == ContactFormTag.tag_id)
+        .filter(ContactFormTag.contact_form_id.in_(contact_ids))
+        .order_by(db.func.lower(Tag.name))
+        .all()
+    )
     result: dict[str, list[dict]] = {contact_id: [] for contact_id in contact_ids}
     for row in rows:
         result.setdefault(row.contact_form_id, []).append({"id": row.id, "name": row.name})
@@ -143,33 +103,20 @@ def get_contact_tags_map(contact_ids: list[str]) -> dict[str, list[dict]]:
 
 
 def sync_project_tags(project_no: str, tag_ids: list[str]) -> None:
-    db.session.execute(
-        text("DELETE FROM project_tags WHERE project_no = :project_no"),
-        {"project_no": project_no},
-    )
+    ProjectTag.query.filter_by(project_no=project_no).delete()
     for tag_id in tag_ids:
-        db.session.execute(
-            text(
-                "INSERT OR IGNORE INTO project_tags (project_no, tag_id) "
-                "VALUES (:project_no, :tag_id)"
-            ),
-            {"project_no": project_no, "tag_id": tag_id},
-        )
+        db.session.add(ProjectTag(project_no=project_no, tag_id=tag_id))
+    db.session.commit()
 
 
 def sync_contact_tags(contact_form_id: str, tag_ids: list[str]) -> None:
-    db.session.execute(
-        text("DELETE FROM contact_form_tags WHERE contact_form_id = :contact_form_id"),
-        {"contact_form_id": contact_form_id},
-    )
+    ContactFormTag.query.filter_by(contact_form_id=contact_form_id).delete()
     for tag_id in tag_ids:
-        db.session.execute(
-            text(
-                "INSERT OR IGNORE INTO contact_form_tags (contact_form_id, tag_id) "
-                "VALUES (:contact_form_id, :tag_id)"
-            ),
-            {"contact_form_id": contact_form_id, "tag_id": tag_id},
-        )
+        db.session.add(ContactFormTag(contact_form_id=contact_form_id, tag_id=tag_id))
+    db.session.commit()
+
+
+# ── 以下为 query-builder 工具函数，供其他 service 构建动态 SQL 使用 ──
 
 
 def build_tag_exists_clause(
@@ -180,6 +127,11 @@ def build_tag_exists_clause(
     tag_ids: list[str],
     param_prefix: str = "filter_tag",
 ) -> tuple[str, dict]:
+    """生成 EXISTS 子查询 SQL 片段（跨表标签过滤）。
+
+    注意：此函数生成 raw SQL 片段嵌入到上层动态 WHERE 子句中，
+    因为上层使用字符串拼接构建 {where_clause}，无法用 ORM。
+    """
     if not tag_ids:
         return "", {}
     placeholders = ", ".join(f":{param_prefix}{i}" for i in range(len(tag_ids)))

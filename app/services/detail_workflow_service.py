@@ -46,13 +46,13 @@ def _now_text() -> str:
 
 
 def needs_detail_workflow(natures: list[str]) -> bool:
-    return "detail" in natures or "plate_layout" in natures
+    return "detail" in natures
 
 
-def initial_plate_layout_status(natures: list[str]) -> str:
-    if "plate_layout" in natures:
-        return PHASE_STATUS_NOT_STARTED
-    return PHASE_STATUS_NOT_APPLICABLE
+def has_plate_layout_phase(workflow: ProjectDetailWorkflow | None) -> bool:
+    if workflow is None:
+        return False
+    return bool(workflow.plate_layout_enabled)
 
 
 def is_main_flow_completed(workflow: ProjectDetailWorkflow, has_plate_layout: bool) -> bool:
@@ -65,6 +65,24 @@ def is_main_flow_completed(workflow: ProjectDetailWorkflow, has_plate_layout: bo
     return True
 
 
+def is_detail_process_completed(
+    natures: list[str],
+    workflow: ProjectDetailWorkflow | None,
+    *,
+    manual_value: bool = False,
+) -> bool:
+    """细化单主任务项目的流程完成判定：调图完成；启用排板时还需排板完成。"""
+    if not needs_detail_workflow(natures):
+        return manual_value
+    if workflow is None:
+        return False
+    if workflow.drawing_status != PHASE_STATUS_COMPLETED:
+        return False
+    if has_plate_layout_phase(workflow) and workflow.plate_layout_status != PHASE_STATUS_COMPLETED:
+        return False
+    return True
+
+
 def map_detail_workflow(
     row: ProjectDetailWorkflow | None,
     *,
@@ -73,6 +91,7 @@ def map_detail_workflow(
     if row is None:
         return None
     return {
+        "plateLayoutEnabled": bool(row.plate_layout_enabled),
         "modelingStatus": row.modeling_status,
         "drawingStatus": row.drawing_status,
         "plateLayoutStatus": row.plate_layout_status,
@@ -109,30 +128,32 @@ def get_detail_workflows_map(project_nos: list[str]) -> dict[str, dict | None]:
     return {project_no: map_detail_workflow(workflows.get(project_no)) for project_no in project_nos}
 
 
+def _apply_plate_layout_enabled(workflow: ProjectDetailWorkflow, enabled: bool) -> None:
+    workflow.plate_layout_enabled = enabled
+    if not enabled:
+        workflow.plate_layout_status = PHASE_STATUS_NOT_APPLICABLE
+        workflow.plate_layout_started_at = None
+        workflow.plate_layout_completed_at = None
+    elif workflow.plate_layout_status == PHASE_STATUS_NOT_APPLICABLE:
+        workflow.plate_layout_status = PHASE_STATUS_NOT_STARTED
+
+
 def ensure_detail_workflow(project_no: str, natures: list[str]) -> ProjectDetailWorkflow | None:
     if not needs_detail_workflow(natures):
         delete_detail_workflow(project_no)
         return None
 
     workflow = get_detail_workflow(project_no)
-    plate_status = initial_plate_layout_status(natures)
     if workflow is None:
         workflow = ProjectDetailWorkflow(
             project_no=project_no,
             modeling_status=PHASE_STATUS_NOT_STARTED,
             drawing_status=PHASE_STATUS_NOT_STARTED,
-            plate_layout_status=plate_status,
+            plate_layout_enabled=True,
+            plate_layout_status=PHASE_STATUS_NOT_STARTED,
         )
         db.session.add(workflow)
         return workflow
-
-    if "plate_layout" in natures:
-        if workflow.plate_layout_status == PHASE_STATUS_NOT_APPLICABLE:
-            workflow.plate_layout_status = PHASE_STATUS_NOT_STARTED
-    else:
-        workflow.plate_layout_status = PHASE_STATUS_NOT_APPLICABLE
-        workflow.plate_layout_started_at = None
-        workflow.plate_layout_completed_at = None
 
     workflow.updated_at = _now_text()
     return workflow
@@ -150,13 +171,59 @@ def resolve_detail_completed(
     *,
     manual_value: bool = False,
 ) -> bool:
-    if not any(nature in {"detail", "detail_issue", "plate_layout", "tile_layout"} for nature in natures):
+    if not any(
+        nature in {"detail", "detail_issue", "floor_deck_layout", "tile_layout"} for nature in natures
+    ):
         return False
     if needs_detail_workflow(natures):
         if workflow is None:
             return False
-        return is_main_flow_completed(workflow, "plate_layout" in natures)
+        return is_main_flow_completed(workflow, has_plate_layout_phase(workflow))
     return manual_value
+
+
+def _complete_phase(
+    workflow: ProjectDetailWorkflow,
+    *,
+    status_field: str,
+    started_field: str,
+    completed_field: str,
+    now: str,
+) -> None:
+    if getattr(workflow, status_field) == PHASE_STATUS_COMPLETED:
+        return
+    _touch_started(workflow, started_field, now)
+    if not getattr(workflow, completed_field):
+        setattr(workflow, completed_field, now)
+    setattr(workflow, status_field, PHASE_STATUS_COMPLETED)
+
+
+def mark_main_flow_completed(workflow: ProjectDetailWorkflow) -> None:
+    """将建模、调图、以及（若启用）钢板排板全部置为已完成。"""
+    now = _now_text()
+    _complete_phase(
+        workflow,
+        status_field="modeling_status",
+        started_field="modeling_started_at",
+        completed_field="modeling_completed_at",
+        now=now,
+    )
+    _complete_phase(
+        workflow,
+        status_field="drawing_status",
+        started_field="drawing_started_at",
+        completed_field="drawing_completed_at",
+        now=now,
+    )
+    if has_plate_layout_phase(workflow):
+        _complete_phase(
+            workflow,
+            status_field="plate_layout_status",
+            started_field="plate_layout_started_at",
+            completed_field="plate_layout_completed_at",
+            now=now,
+        )
+    workflow.updated_at = now
 
 
 def _touch_started(workflow: ProjectDetailWorkflow, field: str, now: str) -> None:
@@ -191,7 +258,7 @@ def apply_workflow_action(project_no: str, action: str, natures: list[str]) -> t
     assert workflow is not None
 
     now = _now_text()
-    has_plate_layout = "plate_layout" in natures
+    has_plate_layout = has_plate_layout_phase(workflow)
 
     if normalized_action == WORKFLOW_ACTION_START_MODELING:
         if workflow.modeling_status != PHASE_STATUS_NOT_STARTED:
@@ -227,7 +294,7 @@ def apply_workflow_action(project_no: str, action: str, natures: list[str]) -> t
 
     elif normalized_action == WORKFLOW_ACTION_START_PLATE_LAYOUT:
         if not has_plate_layout:
-            return None, "当前项目不需要排板"
+            return None, "当前项目未启用钢板排板"
         if workflow.modeling_status != PHASE_STATUS_COMPLETED:
             return None, "建模尚未完成，不能开始排板"
         if workflow.drawing_status not in {PHASE_STATUS_IN_PROGRESS, PHASE_STATUS_COMPLETED}:
@@ -266,7 +333,7 @@ def apply_workflow_action(project_no: str, action: str, natures: list[str]) -> t
 
     elif normalized_action == WORKFLOW_ACTION_RESET_PLATE_LAYOUT:
         if not has_plate_layout:
-            return None, "当前项目不需要排板"
+            return None, "当前项目未启用钢板排板"
         if workflow.plate_layout_status != PHASE_STATUS_IN_PROGRESS:
             return None, "仅进行中的排板可撤回至未开始"
         workflow.plate_layout_status = PHASE_STATUS_NOT_STARTED
@@ -275,7 +342,7 @@ def apply_workflow_action(project_no: str, action: str, natures: list[str]) -> t
 
     elif normalized_action == WORKFLOW_ACTION_REOPEN_PLATE_LAYOUT:
         if not has_plate_layout:
-            return None, "当前项目不需要排板"
+            return None, "当前项目未启用钢板排板"
         if workflow.plate_layout_status != PHASE_STATUS_COMPLETED:
             return None, "仅已完成的排板可重新打开"
         workflow.plate_layout_status = PHASE_STATUS_IN_PROGRESS
@@ -308,10 +375,16 @@ def _validate_plate_layout_status(value: str | None, *, has_plate_layout: bool) 
     if normalized not in VALID_PLATE_LAYOUT_STATUSES:
         return None, "排板状态无效"
     if not has_plate_layout and normalized != PHASE_STATUS_NOT_APPLICABLE:
-        return None, "未勾选项目性质「排板」时，该阶段只能为不适用"
+        return None, "未启用钢板排板时，该阶段只能为不适用"
     if has_plate_layout and normalized == PHASE_STATUS_NOT_APPLICABLE:
-        return None, "已勾选「排板」性质时，不能设为不适用"
+        return None, "已启用钢板排板时，不能设为不适用"
     return normalized, None
+
+
+def _parse_plate_layout_enabled(payload: dict, workflow: ProjectDetailWorkflow) -> bool:
+    if "plateLayoutEnabled" not in payload:
+        return bool(workflow.plate_layout_enabled)
+    return bool(payload.get("plateLayoutEnabled"))
 
 
 def _apply_phase_fields(
@@ -336,7 +409,8 @@ def update_detail_workflow(project_no: str, payload: dict, natures: list[str]) -
     workflow = ensure_detail_workflow(project_no, natures)
     assert workflow is not None
 
-    has_plate_layout = "plate_layout" in natures
+    plate_layout_enabled = _parse_plate_layout_enabled(payload, workflow)
+    has_plate_layout = plate_layout_enabled
 
     modeling_status, error = _validate_phase_status(payload.get("modelingStatus"), field_label="建模")
     if error:
@@ -370,7 +444,11 @@ def update_detail_workflow(project_no: str, payload: dict, natures: list[str]) -
     elif drawing_status == PHASE_STATUS_IN_PROGRESS:
         drawing_completed_at = None
 
-    if plate_layout_status in {PHASE_STATUS_NOT_APPLICABLE, PHASE_STATUS_NOT_STARTED}:
+    if not has_plate_layout:
+        plate_layout_status = PHASE_STATUS_NOT_APPLICABLE
+        plate_layout_started_at = None
+        plate_layout_completed_at = None
+    elif plate_layout_status in {PHASE_STATUS_NOT_APPLICABLE, PHASE_STATUS_NOT_STARTED}:
         plate_layout_started_at = None
         plate_layout_completed_at = None
     elif plate_layout_status == PHASE_STATUS_IN_PROGRESS:
@@ -388,6 +466,8 @@ def update_detail_workflow(project_no: str, payload: dict, natures: list[str]) -
         and plate_layout_started_at
     ):
         plate_layout_completed_at = plate_layout_started_at
+
+    _apply_plate_layout_enabled(workflow, plate_layout_enabled)
 
     _apply_phase_fields(
         workflow,

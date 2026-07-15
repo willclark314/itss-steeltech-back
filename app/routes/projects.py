@@ -1,11 +1,25 @@
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import get_jwt, jwt_required
 
-from app.services import project_service, tag_service
+from app.services import project_flow_filter, project_service, tag_service
 from app.services.auth_scope import is_jwt_admin
 from app.utils.pagination import parse_list_page_query
+from app.utils.route_permissions import register_read_write_guard
 
 projects_bp = Blueprint("projects", __name__)
+
+register_read_write_guard(
+    projects_bp,
+    view_codes=(
+        "project-browse:view",
+        "project:view",
+        "my:view",
+        "schedule:view",
+        "design-team-schedule:view",
+        "detail-team-schedule:view",
+    ),
+    my_write_codes=("my:view",),
+)
 
 
 @projects_bp.get("/check")
@@ -24,6 +38,12 @@ def list_projects():
         status=request.args.get("status", ""),
         assigned_personnel_id=request.args.get("assignedPersonnelId", ""),
         tag_ids=tag_service.parse_tags_param(request.args.get("tags", "")),
+        nature_filters=project_flow_filter.parse_nature_filters(request.args.get("natures", "")),
+        flow_filters=project_flow_filter.parse_flow_filters(request.args.get("flowFilters", "")),
+        personnel_team=request.args.get("personnelTeam", ""),
+        exclude_project_nos=project_flow_filter.parse_exclude_project_nos(
+            request.args.get("excludeProjectNos", ""),
+        ),
         page_query=page_query,
         load_all=load_all,
     )
@@ -34,6 +54,23 @@ def list_projects():
 def create_project():
     data = request.get_json(silent=True) or {}
     result, error, status = project_service.create_project(data)
+    if error:
+        return jsonify({"message": error}), status
+    return jsonify(result), status
+
+
+@projects_bp.post("/<path:project_no>/copy")
+def copy_project_route(project_no: str):
+    data = request.get_json(silent=True) or {}
+    result, error, status = project_service.copy_project(project_no, data)
+    if error:
+        return jsonify({"message": error}), status
+    return jsonify(result), status
+
+
+@projects_bp.post("/<path:project_no>/split")
+def split_project_route(project_no: str):
+    result, error, status = project_service.split_project(project_no)
     if error:
         return jsonify({"message": error}), status
     return jsonify(result), status
@@ -54,6 +91,15 @@ def delete_project(project_no: str):
     if not deleted:
         return jsonify({"message": "项目不存在"}), 404
     return jsonify({"ok": True})
+
+
+@projects_bp.put("/<path:project_no>/design-workflow")
+def put_design_workflow(project_no: str):
+    data = request.get_json(silent=True) or {}
+    result, error, status = project_service.save_design_workflow(project_no, data)
+    if error:
+        return jsonify({"message": error}), status
+    return jsonify(result), status
 
 
 @projects_bp.put("/<path:project_no>/detail-workflow")

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from sqlalchemy import text
-
 from steeltech_db.extensions import db
 from steeltech_db.models import Permission, Personnel, Role, RolePermission, RolePersonnel
 
@@ -13,7 +11,7 @@ def get_role_permissions(role_id: str) -> list[dict]:
     rows = (
         db.session.query(Permission)
         .join(RolePermission, RolePermission.permission_id == Permission.id)
-        .filter(RolePermission.role_id == role_id)
+        .filter(RolePermission.role_id == role_id, Permission.action == "view")
         .all()
     )
     return sort_permissions([row.to_dict() for row in rows])
@@ -47,7 +45,7 @@ def map_role(row: Role) -> dict:
 
 
 def list_permissions() -> list[dict]:
-    rows = Permission.query.all()
+    rows = Permission.query.filter_by(action="view").all()
     return sort_permissions([row.to_dict() for row in rows])
 
 
@@ -84,10 +82,15 @@ def list_roles(*, keyword: str = "", status: str = "") -> list[dict]:
 
 def normalize_permission_ids(ids: list[str] | None) -> tuple[list[str] | None, str | None]:
     unique = list(dict.fromkeys(item.strip() for item in (ids or []) if item and item.strip()))
+    view_ids: list[str] = []
     for permission_id in unique:
-        if Permission.query.get(permission_id) is None:
+        permission = Permission.query.get(permission_id)
+        if permission is None:
             return None, "权限不存在"
-    return unique, None
+        if permission.action != "view":
+            continue
+        view_ids.append(permission_id)
+    return view_ids, None
 
 
 def normalize_assigned_personnel_ids(ids: list[str] | None) -> tuple[list[str] | None, str | None]:
@@ -102,33 +105,17 @@ def normalize_assigned_personnel_ids(ids: list[str] | None) -> tuple[list[str] |
 
 
 def sync_role_permissions(role_id: str, permission_ids: list[str]) -> None:
-    db.session.execute(
-        text("DELETE FROM role_permissions WHERE role_id = :role_id"),
-        {"role_id": role_id},
-    )
+    RolePermission.query.filter_by(role_id=role_id).delete()
     for permission_id in permission_ids:
-        db.session.execute(
-            text(
-                "INSERT OR IGNORE INTO role_permissions (role_id, permission_id, created_at) "
-                "VALUES (:role_id, :permission_id, datetime('now', 'localtime'))"
-            ),
-            {"role_id": role_id, "permission_id": permission_id},
-        )
+        db.session.add(RolePermission(role_id=role_id, permission_id=permission_id))
+    db.session.commit()
 
 
 def sync_role_personnel(role_id: str, personnel_ids: list[str]) -> None:
-    db.session.execute(
-        text("DELETE FROM role_personnel WHERE role_id = :role_id"),
-        {"role_id": role_id},
-    )
+    RolePersonnel.query.filter_by(role_id=role_id).delete()
     for personnel_id in personnel_ids:
-        db.session.execute(
-            text(
-                "INSERT OR IGNORE INTO role_personnel (role_id, personnel_id, created_at) "
-                "VALUES (:role_id, :personnel_id, datetime('now', 'localtime'))"
-            ),
-            {"role_id": role_id, "personnel_id": personnel_id},
-        )
+        db.session.add(RolePersonnel(role_id=role_id, personnel_id=personnel_id))
+    db.session.commit()
 
 
 def generate_role_id() -> str:
@@ -202,16 +189,19 @@ def update_role(role_id: str, payload: dict) -> tuple[dict | None, str | None, i
     if duplicate:
         return None, f"角色编码 {code} 已存在", 409
 
-    permission_ids, permission_error = normalize_permission_ids(
-        payload.get("permissionIds") or [item["id"] for item in get_role_permissions(role_id)]
-    )
+    if "permissionIds" in payload:
+        raw_permission_ids = payload.get("permissionIds") or []
+    else:
+        raw_permission_ids = [item["id"] for item in get_role_permissions(role_id)]
+    permission_ids, permission_error = normalize_permission_ids(raw_permission_ids)
     if permission_error:
         return None, permission_error, 400
 
-    personnel_ids, personnel_error = normalize_assigned_personnel_ids(
-        payload.get("assignedPersonnelIds")
-        or [item["id"] for item in get_role_personnel(role_id)]
-    )
+    if "assignedPersonnelIds" in payload:
+        raw_personnel_ids = payload.get("assignedPersonnelIds") or []
+    else:
+        raw_personnel_ids = [item["id"] for item in get_role_personnel(role_id)]
+    personnel_ids, personnel_error = normalize_assigned_personnel_ids(raw_personnel_ids)
     if personnel_error:
         return None, personnel_error, 400
 

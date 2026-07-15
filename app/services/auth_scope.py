@@ -33,7 +33,11 @@ def has_admin_role(personnel_id: str) -> bool:
     admin_role = (
         db.session.query(RolePersonnel)
         .join(Role, Role.id == RolePersonnel.role_id)
-        .filter(RolePersonnel.personnel_id == personnel_id, Role.code == "admin")
+        .filter(
+            RolePersonnel.personnel_id == personnel_id,
+            Role.code == "admin",
+            Role.status == "active",
+        )
         .first()
     )
     return admin_role is not None

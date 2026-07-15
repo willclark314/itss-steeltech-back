@@ -13,4 +13,8 @@ venv/
 /.temp
 /datas/backups
 /datas/files/contact-pdfs
+/datas/files/contact-attachments
+/datas/files/weekly-meeting-images
+/datas/files/weekly-meeting-scans
 /datas/files/path_template
+/tests

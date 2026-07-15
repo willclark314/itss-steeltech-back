@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 
 from app.services.system_config_service import get_local_work_path_config
-from steeltech_db.defaults import normalize_drive
 
 
 def normalize_relative_path(value: str) -> str:
@@ -32,18 +31,17 @@ def normalize_relative_path(value: str) -> str:
     return trimmed.replace("/", "\\").lstrip("\\")
 
 
-def infer_share_letter(relative_path: str, drive: str) -> str:
+def infer_share_letter(relative_path: str) -> str:
     if "深化组" in relative_path or "加工单归档" in relative_path:
         return "f"
     if "设计组" in relative_path:
         return "e"
-    return normalize_drive(drive).lower()
+    return "f"
 
 
 def build_full_path_with_ip(
     relative_path: str,
     ip: str,
-    drive: str = "F",
     config: dict | None = None,
 ) -> str:
     normalized = normalize_relative_path(relative_path)
@@ -52,21 +50,19 @@ def build_full_path_with_ip(
 
     work_path = config or get_local_work_path_config()
     target_ip = str(ip or work_path.get("ip", "")).strip()
-    target_drive = normalize_drive(str(drive or work_path.get("drive", "F")))
 
     share_prefix = re.match(r"^([A-Za-z])\\(.+)$", normalized, re.IGNORECASE)
     if share_prefix:
         return f"\\\\{target_ip}\\{share_prefix.group(1).lower()}\\{share_prefix.group(2)}"
 
-    share = infer_share_letter(normalized, target_drive)
+    share = infer_share_letter(normalized)
     return f"\\\\{target_ip}\\{share}\\{normalized}"
 
 
 def build_full_path(relative_path: str, config: dict | None = None) -> str:
     work_path = config or get_local_work_path_config()
     ip = str(work_path.get("ip", "")).strip()
-    drive = normalize_drive(str(work_path.get("drive", "F")))
-    return build_full_path_with_ip(relative_path, ip, drive, work_path)
+    return build_full_path_with_ip(relative_path, ip, work_path)
 
 
 def normalize_access_path(full_path: str) -> str:

@@ -6,8 +6,11 @@ from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
 
 from app.services import temp_task_service
+from app.utils.route_permissions import register_any_permission_guard
 
 temp_tasks_bp = Blueprint("temp_tasks", __name__)
+
+register_any_permission_guard(temp_tasks_bp, "my:view")
 
 
 @temp_tasks_bp.get("")

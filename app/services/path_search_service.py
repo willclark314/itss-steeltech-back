@@ -4,6 +4,8 @@ import os
 import re
 from datetime import datetime
 
+from steeltech_db.project_split import has_hyphen_split_suffix, parse_base_project_no
+
 from app.services.system_config_service import get_local_work_path_config
 from app.utils.paths import build_full_path, normalize_access_path, normalize_relative_path
 
@@ -113,6 +115,9 @@ def _infer_is_jiagongdan(
     if "加工单" in (project_name or ""):
         return True
 
+    if "甲供" in (project_name or ""):
+        return True
+
     for contact_id in contact_form_ids or []:
         if (contact_id or "").startswith("加工单-"):
             return True
@@ -124,13 +129,60 @@ def _infer_is_jiagongdan(
     return False
 
 
-def _folder_matches_project(folder_name: str, five_digits: str) -> bool:
-    if not five_digits:
+def extract_path_match_key(project_no: str) -> str:
+    """用于文件夹名匹配：AB25059-1 → 25059-1，AB25059 → 25059。"""
+    trimmed = parse_base_project_no(project_no)
+    without_prefix = re.sub(r"^[A-Za-z]+", "", trimmed)
+    hyphen_match = re.fullmatch(r"(\d+-\d+)", without_prefix)
+    if hyphen_match:
+        return hyphen_match.group(1)
+    if without_prefix and without_prefix.isdigit():
+        return without_prefix
+    digits = re.sub(r"\D", "", without_prefix)
+    return digits or trimmed
+
+
+def _folder_matches_project(folder_name: str, project_no: str) -> bool:
+    base_no = parse_base_project_no(project_no)
+    base_upper = base_no.upper()
+    folder_upper = folder_name.upper()
+
+    if has_hyphen_split_suffix(project_no):
+        if base_upper in folder_upper:
+            return True
+        match_key = extract_path_match_key(project_no)
+        return bool(match_key) and match_key in folder_name
+
+    if base_upper in folder_upper:
+        return True
+
+    five_digits = extract_five_digit_project_no(project_no)
+    if not five_digits or five_digits not in folder_name:
         return False
-    return five_digits in folder_name
+
+    if re.search(rf"{re.escape(five_digits)}-\d+", folder_name) and base_upper not in folder_upper:
+        return False
+    return True
 
 
-def _score_folder(folder_name: str, five_digits: str) -> int:
+def _score_folder(folder_name: str, project_no: str) -> int:
+    base_no = parse_base_project_no(project_no)
+    base_upper = base_no.upper()
+    folder_upper = folder_name.upper()
+    five_digits = extract_five_digit_project_no(project_no)
+
+    if has_hyphen_split_suffix(project_no):
+        match_key = extract_path_match_key(project_no)
+        if folder_upper.startswith(f"{base_upper}#"):
+            return 0
+        if match_key and folder_name.startswith(f"{match_key}#"):
+            return 1
+        if base_upper in folder_upper:
+            return 2
+        if match_key and match_key in folder_name:
+            return 3
+        return 99
+
     if folder_name.startswith(f"{five_digits}#"):
         return 0
     if folder_name.startswith(five_digits):
@@ -150,12 +202,22 @@ def _resolve_archive_templates(
         dict.fromkeys(
             item
             for item in (natures or [])
-            if item in {"design", "detail", "detail_issue", "plate_layout", "tile_layout"}
+            if item in {
+                "design",
+                "detail",
+                "detail_issue",
+                "plate_layout",
+                "floor_deck_layout",
+                "tile_layout",
+            }
         )
     )
     templates: list[str] = []
 
-    if any(item in {"detail", "detail_issue", "plate_layout", "tile_layout"} for item in unique):
+    if any(
+        item in {"detail", "detail_issue", "plate_layout", "floor_deck_layout", "tile_layout"}
+        for item in unique
+    ):
         templates.append(
             _JIAGONGDAN_ARCHIVE_TEMPLATE if is_jiagongdan else _DETAIL_ARCHIVE_TEMPLATE
         )
@@ -273,8 +335,8 @@ def _full_path_to_relative(full_path: str, config: dict) -> str:
     return normalize_relative_path(normalized)
 
 
-def _list_archive_folder_matches(archive_full_root: str, five_digits: str) -> list[str]:
-    """仅在末级归档目录的直接子文件夹中匹配 5 位项目号。"""
+def _list_archive_folder_matches(archive_full_root: str, project_no: str) -> list[str]:
+    """仅在末级归档目录的直接子文件夹中匹配项目号。"""
     if not archive_full_root or not os.path.isdir(archive_full_root):
         return []
 
@@ -284,7 +346,7 @@ def _list_archive_folder_matches(archive_full_root: str, five_digits: str) -> li
             for entry in entries:
                 if not entry.is_dir(follow_symlinks=False):
                     continue
-                if not _folder_matches_project(entry.name, five_digits):
+                if not _folder_matches_project(entry.name, project_no):
                     continue
                 matches.append(entry.path)
     except OSError:
@@ -337,7 +399,7 @@ def search_project_paths(
     found: dict[str, dict] = {}
     for root in archive_roots:
         full_root = normalize_access_path(build_full_path(root, config))
-        for full_path in _list_archive_folder_matches(full_root, five_digits):
+        for full_path in _list_archive_folder_matches(full_root, project_no):
             relative = _full_path_to_relative(full_path, config)
             if not relative:
                 continue
@@ -346,7 +408,7 @@ def search_project_paths(
                 continue
 
             folder_name = os.path.basename(full_path.rstrip("/\\"))
-            score = _score_folder(folder_name, five_digits)
+            score = _score_folder(folder_name, project_no)
             display_full_path = build_full_path(relative, config)
             existing = found.get(relative)
             if existing is None or score < existing["score"]:
