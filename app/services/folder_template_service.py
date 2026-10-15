@@ -6,6 +6,10 @@ from datetime import datetime
 from pathlib import Path
 
 from app.config import Config
+from app.services.contact_service import (
+    list_project_contact_material_files,
+    list_project_jiagongdan_material_files,
+)
 from app.services.system_config_service import get_local_work_path_config
 from app.utils.paths import build_full_path_with_ip, normalize_access_path, normalize_relative_path
 
@@ -19,6 +23,11 @@ FOLDER_NAME_NOISE_PATTERNS = (
     re.compile(r"^（空样板[!！]勿剪切）\s*"),
     re.compile(r"\s*【待安排@@】\(需排瓦&不排瓦\)(?:\(GJGJSK-[\d.]+版\))?"),
 )
+INVALID_ARCHIVE_FILE_NAME_CHARS = re.compile(r'[<>:"/\\|?*]')
+JIAGONGDAN_MATERIALS_DIR = "1，甲供资料"
+DESIGN_CONTACT_MATERIALS_SUBDIR = "1-联系单及甲供其他资料"
+DETAIL_CONTACT_PRIMARY_SUBDIR = "1-设计蓝图及沟通记录/2-联系单"
+DETAIL_CONTACT_SUPPLEMENT_SUBDIR = "1-设计蓝图及沟通记录/1-蓝图设计图及答疑单"
 
 ARCHIVE_COPY_PROFILES: dict[str, dict] = {
     "design": {
@@ -28,6 +37,9 @@ ARCHIVE_COPY_PROFILES: dict[str, dict] = {
         "directoryReadme": "目录说明.txt",
         "packReadme": "打包说明.txt",
         "packReadmePaths": [".", "06 归档"],
+        "copyContactMaterials": True,
+        "contactPrimarySubdir": DESIGN_CONTACT_MATERIALS_SUBDIR,
+        "contactSupplementSubdir": DESIGN_CONTACT_MATERIALS_SUBDIR,
     },
     "detail": {
         "label": "细化组项目目录",
@@ -41,6 +53,9 @@ ARCHIVE_COPY_PROFILES: dict[str, dict] = {
         "directoryReadme": "目录说明.txt",
         "packReadme": "打包说明.txt",
         "packReadmePaths": [".", "3-加工图及清单/8-清单"],
+        "copyContactMaterials": True,
+        "contactPrimarySubdir": DETAIL_CONTACT_PRIMARY_SUBDIR,
+        "contactSupplementSubdir": DETAIL_CONTACT_SUPPLEMENT_SUBDIR,
     },
     "detailJiagongdan": {
         "label": "细化加工单项目目录",
@@ -49,11 +64,14 @@ ARCHIVE_COPY_PROFILES: dict[str, dict] = {
             "项目名称": "{projectName}",
             "工程名称": "{projectName}",
         },
-        "createInnerProjectFolder": True,
-        "unwrapMainProjectDir": True,
+        "createInnerProjectFolder": False,
+        "preserveMainProjectFolder": True,
+        "unwrapMainProjectDir": False,
         "directoryReadme": "目录说明.txt",
         "packReadme": "打包说明.txt",
-        "packReadmePaths": [".", "3-加工图及清单/8-清单"],
+        "packReadmePaths": [".", "2，清单"],
+        "jiagongdanMaterialsDir": JIAGONGDAN_MATERIALS_DIR,
+        "copyJiagongdanContactMaterials": True,
     },
 }
 
@@ -321,8 +339,8 @@ def _write_pack_readme_files(
     )
 
     for raw_path in pack_paths:
-        relative = str(raw_path or ".").strip().replace("/", "\\").strip("\\")
-        target_dir = project_root if not relative or relative == "." else project_root / relative
+        relative = str(raw_path or ".").strip()
+        target_dir = _join_project_relative(project_root, relative)
         if not target_dir.exists():
             target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -461,6 +479,142 @@ def _build_inner_project_folder_name(variables: dict[str, str]) -> str:
     return project_no
 
 
+def _sanitize_archive_file_name(name: str) -> str:
+    cleaned = INVALID_ARCHIVE_FILE_NAME_CHARS.sub("_", str(name or "").strip())
+    return cleaned or "file"
+
+
+def _unique_target_file(directory: Path, file_name: str) -> Path:
+    safe_name = _sanitize_archive_file_name(file_name)
+    target = directory / safe_name
+    if not target.exists():
+        return target
+
+    stem = Path(safe_name).stem
+    suffix = Path(safe_name).suffix
+    index = 2
+    while True:
+        candidate = directory / f"{stem} ({index}){suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def _resolve_jiagongdan_materials_dir(managed_root: Path, profile: dict) -> Path:
+    preferred = str(profile.get("jiagongdanMaterialsDir") or JIAGONGDAN_MATERIALS_DIR).strip()
+    preferred_path = managed_root / preferred
+    if preferred_path.is_dir():
+        return preferred_path
+
+    for child in sorted(managed_root.iterdir(), key=lambda item: item.name.lower()):
+        if child.is_dir() and "甲供资料" in child.name:
+            return child
+
+    preferred_path.mkdir(parents=True, exist_ok=True)
+    return preferred_path
+
+
+def _join_project_relative(project_root: Path, relative_path: str) -> Path:
+    """Join a Windows-or-POSIX relative path onto project_root (safe on Linux mounts)."""
+    normalized = str(relative_path or "").strip().replace("\\", "/").strip("/")
+    if not normalized or normalized == ".":
+        return project_root
+    result = project_root
+    for part in normalized.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            raise FolderTemplateError("路径不能包含 ..")
+        result = result / part
+    return result
+
+
+def _resolve_profile_subdir(project_root: Path, relative_path: str) -> Path:
+    return _join_project_relative(project_root, relative_path)
+
+
+def _copy_project_contact_materials(
+    project_root: Path,
+    profile: dict,
+    variables: dict[str, str],
+    skip_existing: bool,
+    created_dirs: list[str],
+    skipped_dirs: list[str],
+    created_files: list[str],
+    skipped_files: list[str],
+) -> None:
+    project_no = str(variables.get("projectNo") or "").strip()
+    if not project_no:
+        return
+
+    if bool(profile.get("copyJiagongdanContactMaterials")):
+        materials = list_project_jiagongdan_material_files(project_no)
+        if not materials:
+            return
+        target_dir = _resolve_jiagongdan_materials_dir(project_root, profile)
+        if not target_dir.exists():
+            _ensure_directory(target_dir, skip_existing, created_dirs, skipped_dirs)
+        for item in materials:
+            source = item["sourcePath"]
+            if not isinstance(source, Path) or not source.is_file():
+                continue
+            target = _unique_target_file(target_dir, str(item.get("fileName") or source.name))
+            _copy_file(source, target, skip_existing, created_files, skipped_files)
+        return
+
+    if not bool(profile.get("copyContactMaterials")):
+        return
+
+    materials = list_project_contact_material_files(project_no)
+    if not materials:
+        return
+
+    primary_subdir = str(
+        profile.get("contactPrimarySubdir") or DETAIL_CONTACT_PRIMARY_SUBDIR
+    ).strip()
+    supplement_subdir = str(
+        profile.get("contactSupplementSubdir") or DETAIL_CONTACT_SUPPLEMENT_SUBDIR
+    ).strip()
+
+    for item in materials:
+        source = item["sourcePath"]
+        if not isinstance(source, Path) or not source.is_file():
+            continue
+
+        attachment_type = str(item.get("attachmentType") or "").strip()
+        if attachment_type == "primary":
+            relative_dir = primary_subdir
+        else:
+            relative_dir = supplement_subdir
+
+        target_dir = _resolve_profile_subdir(project_root, relative_dir)
+        if not target_dir.exists():
+            _ensure_directory(target_dir, skip_existing, created_dirs, skipped_dirs)
+
+        target = _unique_target_file(target_dir, str(item.get("fileName") or source.name))
+        _copy_file(source, target, skip_existing, created_files, skipped_files)
+
+
+def _collect_jiagongdan_copy_entries(source_root: Path) -> tuple[Path, list[Path]]:
+    """甲供模板保留主项目目录名（含【甲供】等后缀），并复制同层的变更通知单等样板。"""
+    effective_main = _resolve_effective_template_source(source_root)
+    resolved_source = source_root.resolve()
+    if effective_main.resolve() == resolved_source:
+        return effective_main, []
+
+    parent = effective_main.parent
+    try:
+        parent.relative_to(resolved_source)
+    except ValueError:
+        return effective_main, []
+
+    siblings = [
+        item for item in sorted(parent.iterdir(), key=lambda item: item.name.lower())
+        if item != effective_main and item.is_dir()
+    ]
+    return effective_main, siblings
+
+
 def _generate_from_archive_template(
     source_root: Path,
     project_root: Path,
@@ -471,33 +625,23 @@ def _generate_from_archive_template(
     skipped_dirs: list[str],
     created_files: list[str],
     skipped_files: list[str],
-) -> None:
+) -> Path:
     name_tokens = profile.get("nameTokens") if isinstance(profile.get("nameTokens"), dict) else {}
-    effective_source = _resolve_effective_template_source(source_root)
+    preserve_main_folder = bool(profile.get("preserveMainProjectFolder"))
     pseudo_template = {
         "nameTokens": name_tokens,
         "preserveSourceRoot": False,
-        "unwrapMainProjectDir": bool(profile.get("unwrapMainProjectDir")),
+        "unwrapMainProjectDir": False if preserve_main_folder else bool(profile.get("unwrapMainProjectDir")),
         "directoryReadme": profile.get("directoryReadme"),
         "packReadme": profile.get("packReadme"),
         "packReadmePaths": profile.get("packReadmePaths"),
     }
 
-    if bool(profile.get("createInnerProjectFolder")):
-        inner_name = _build_inner_project_folder_name(variables)
-        if not inner_name:
-            raise FolderTemplateError("无法生成内层项目文件夹名称")
-        managed_root = project_root / inner_name
-        _ensure_directory(managed_root, skip_existing, created_dirs, skipped_dirs)
-        copy_target = managed_root
-    else:
-        managed_root = project_root
-        copy_target = project_root
-
-    for child in sorted(effective_source.iterdir(), key=lambda item: item.name.lower()):
+    if preserve_main_folder:
+        effective_main, sibling_dirs = _collect_jiagongdan_copy_entries(source_root)
         _copy_source_entry(
-            child,
-            copy_target,
+            effective_main,
+            project_root,
             variables,
             pseudo_template,
             skip_existing,
@@ -506,21 +650,68 @@ def _generate_from_archive_template(
             created_files,
             skipped_files,
         )
+        for sibling in sibling_dirs:
+            _copy_source_entry(
+                sibling,
+                project_root,
+                variables,
+                pseudo_template,
+                skip_existing,
+                created_dirs,
+                skipped_dirs,
+                created_files,
+                skipped_files,
+            )
+        translated_main_name = _translate_name(effective_main.name, variables, name_tokens)
+        managed_root = project_root / translated_main_name
+        if not managed_root.exists():
+            managed_root = project_root
+    elif bool(profile.get("createInnerProjectFolder")):
+        inner_name = _build_inner_project_folder_name(variables)
+        if not inner_name:
+            raise FolderTemplateError("无法生成内层项目文件夹名称")
+        managed_root = project_root / inner_name
+        _ensure_directory(managed_root, skip_existing, created_dirs, skipped_dirs)
+        copy_target = managed_root
+        effective_source = _resolve_effective_template_source(source_root)
+        for child in sorted(effective_source.iterdir(), key=lambda item: item.name.lower()):
+            _copy_source_entry(
+                child,
+                copy_target,
+                variables,
+                pseudo_template,
+                skip_existing,
+                created_dirs,
+                skipped_dirs,
+                created_files,
+                skipped_files,
+            )
+    else:
+        managed_root = project_root
+        effective_source = _resolve_effective_template_source(source_root)
+        for child in sorted(effective_source.iterdir(), key=lambda item: item.name.lower()):
+            _copy_source_entry(
+                child,
+                project_root,
+                variables,
+                pseudo_template,
+                skip_existing,
+                created_dirs,
+                skipped_dirs,
+                created_files,
+                skipped_files,
+            )
 
-    managed_dirs = [path for path in managed_root.rglob("*") if path.is_dir()]
-    managed_dirs.append(managed_root)
-    managed_dirs.sort(key=lambda path: len(path.parts))
-
-    for directory in managed_dirs:
-        _write_directory_readme(
-            directory,
-            managed_root,
-            variables,
-            pseudo_template,
-            skip_existing,
-            created_files,
-            skipped_files,
-        )
+    # 目录说明仅写在项目根目录，不向各子目录扩散
+    _write_directory_readme(
+        managed_root,
+        managed_root,
+        variables,
+        pseudo_template,
+        skip_existing,
+        created_files,
+        skipped_files,
+    )
 
     _write_pack_readme_files(
         managed_root,
@@ -530,6 +721,20 @@ def _generate_from_archive_template(
         created_files,
         skipped_files,
     )
+
+    if bool(profile.get("copyJiagongdanContactMaterials")) or bool(profile.get("copyContactMaterials")):
+        _copy_project_contact_materials(
+            managed_root,
+            profile,
+            variables,
+            skip_existing,
+            created_dirs,
+            skipped_dirs,
+            created_files,
+            skipped_files,
+        )
+
+    return managed_root
 
 
 def generate_folder_structure(payload: dict) -> dict:

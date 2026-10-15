@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from flask_jwt_extended import get_jwt, get_jwt_identity
 
-from steeltech_db.extensions import db
-from steeltech_db.models import Personnel, Role, RolePersonnel
+from steeltech_db.models import Personnel
+
+from app.services.role_binding_service import personnel_has_role_code
 
 
 def is_dev_account(claims: dict | None = None) -> bool:
@@ -30,17 +31,7 @@ def is_dev_admin_account(claims: dict | None = None) -> bool:
 
 
 def has_admin_role(personnel_id: str) -> bool:
-    admin_role = (
-        db.session.query(RolePersonnel)
-        .join(Role, Role.id == RolePersonnel.role_id)
-        .filter(
-            RolePersonnel.personnel_id == personnel_id,
-            Role.code == "admin",
-            Role.status == "active",
-        )
-        .first()
-    )
-    return admin_role is not None
+    return personnel_has_role_code(personnel_id, "admin")
 
 
 def is_jwt_admin() -> bool:

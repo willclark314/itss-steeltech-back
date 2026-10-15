@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 
 from app.services.system_config_service import get_local_work_path_config
@@ -68,11 +69,24 @@ def build_full_path(relative_path: str, config: dict | None = None) -> str:
 def normalize_access_path(full_path: str) -> str:
     """将 UNC 路径转换为当前系统可访问的形式。
 
-    在部分 Windows 环境下，\\\\ip\\share\\path 无法访问，但 //ip/share/path 可以。
+    - Windows 本机：\\\\ip\\share\\path → //ip/share/path（部分环境后者可访问）
+    - Linux 容器：若设置 FILESERVER_MOUNT_ROOT（如 /mnt/archive），则
+      \\\\ip\\f\\a\\b → /mnt/archive/f/a/b（对应 CIFS 挂载的共享盘符）
     """
     trimmed = (full_path or "").strip()
     if not trimmed:
         return ""
-    if trimmed.startswith("\\\\"):
-        return trimmed.replace("\\", "/")
+
+    mount_root = os.getenv("FILESERVER_MOUNT_ROOT", "").strip().rstrip("/\\")
+    slash_path = trimmed.replace("\\", "/")
+    if mount_root:
+        # //ip/f/rest 或 //ip/f
+        unc_match = re.match(r"^//[^/]+/([A-Za-z])(?:/(.*))?$", slash_path)
+        if unc_match:
+            share = unc_match.group(1).lower()
+            rest = (unc_match.group(2) or "").strip("/")
+            return f"{mount_root}/{share}/{rest}" if rest else f"{mount_root}/{share}"
+
+    if trimmed.startswith("\\\\") or slash_path.startswith("//"):
+        return slash_path
     return trimmed

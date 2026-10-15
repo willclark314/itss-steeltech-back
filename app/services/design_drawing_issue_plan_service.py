@@ -12,7 +12,14 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, Side
 
 from steeltech_db.extensions import db
-from steeltech_db.models import DesignDrawingIssuePlan, SystemSetting
+from steeltech_db.models import DesignDrawingIssuePlan, DrawingIssuePlan, SystemSetting
+
+from app.services.floor_deck_issue_date_sync import (
+    enrich_records_with_peer_floor_deck,
+    existing_project_nos,
+    inherit_floor_deck_for_new_projects,
+    sync_floor_deck_to_peer,
+)
 
 _PLAN_TITLE_PATTERN = re.compile(r"(\d{4})年(\d{1,2})月")
 _HEADER_MARKERS = ("序号", "项目名称", "项目编号")
@@ -21,6 +28,20 @@ _DISPLAY_SETTINGS_KEY = "design_drawing_issue_plan_display"
 _MIN_APPROACHING_DAYS = 0
 _MAX_APPROACHING_DAYS = 30
 _DEFAULT_APPROACHING_DAYS = 7
+_EXPORT_HEADERS = [
+    "序号",
+    "项目名称",
+    "项目编号",
+    "构件重量/吨",
+    "备料清单",
+    "设计计划发图",
+    "设计实际发图",
+    "排瓦计划发图",
+    "排瓦实际发图",
+    "排楼承板计划发图",
+    "排楼承板实际发图",
+    "备注",
+]
 
 
 def _now_str() -> str:
@@ -89,7 +110,14 @@ def list_design_drawing_issue_plans(*, year: int | None = None, month: int | Non
         DesignDrawingIssuePlan.month.desc(),
         DesignDrawingIssuePlan.seq.asc(),
     ).all()
-    return [row.to_dict() for row in rows]
+    records = [row.to_dict() for row in rows]
+    return enrich_records_with_peer_floor_deck(
+        records,
+        year=year,
+        month=month,
+        self_model=DesignDrawingIssuePlan,
+        peer_model=DrawingIssuePlan,
+    )
 
 
 def _validate_record(data: dict, *, require_id: bool = True) -> tuple[dict | None, str | None]:
@@ -100,8 +128,12 @@ def _validate_record(data: dict, *, require_id: bool = True) -> tuple[dict | Non
     project_name = str(data.get("projectName", "")).strip()
     project_no = str(data.get("projectNo", "")).strip()
     component_weight_kg = _normalize_weight(data.get("componentWeightKg"))
-    planned_issue_date = _normalize_date(data.get("plannedIssueDate"))
-    actual_issue_date = _normalize_date(data.get("actualIssueDate"))
+    design_planned_issue_date = _normalize_date(data.get("designPlannedIssueDate"))
+    design_actual_issue_date = _normalize_date(data.get("designActualIssueDate"))
+    tile_layout_planned_issue_date = _normalize_date(data.get("tileLayoutPlannedIssueDate"))
+    tile_layout_actual_issue_date = _normalize_date(data.get("tileLayoutActualIssueDate"))
+    floor_deck_planned_issue_date = _normalize_date(data.get("floorDeckPlannedIssueDate"))
+    floor_deck_actual_issue_date = _normalize_date(data.get("floorDeckActualIssueDate"))
     material_prep_list_issue_date = _normalize_date(data.get("materialPrepListIssueDate"))
     remark = str(data.get("remark", "") or "").strip()
 
@@ -135,8 +167,12 @@ def _validate_record(data: dict, *, require_id: bool = True) -> tuple[dict | Non
         "project_name": project_name,
         "project_no": project_no,
         "component_weight_kg": component_weight_kg,
-        "planned_issue_date": planned_issue_date,
-        "actual_issue_date": actual_issue_date,
+        "design_planned_issue_date": design_planned_issue_date,
+        "design_actual_issue_date": design_actual_issue_date,
+        "tile_layout_planned_issue_date": tile_layout_planned_issue_date,
+        "tile_layout_actual_issue_date": tile_layout_actual_issue_date,
+        "floor_deck_planned_issue_date": floor_deck_planned_issue_date,
+        "floor_deck_actual_issue_date": floor_deck_actual_issue_date,
         "material_prep_list_issue_date": material_prep_list_issue_date,
         "remark": remark,
     }, None
@@ -164,6 +200,22 @@ def batch_replace_month_plans(records: list[dict]) -> tuple[list[dict] | None, s
     assert year is not None and month is not None
     now = _now_str()
 
+    seen_project_nos: set[str] = set()
+    for payload in normalized:
+        key = payload["project_no"].upper()
+        if key in seen_project_nos:
+            return None, f"同月同一项目不能重复：{payload['project_no']}", 400
+        seen_project_nos.add(key)
+
+    prior_nos = existing_project_nos(DesignDrawingIssuePlan, year, month)
+    inherit_floor_deck_for_new_projects(
+        normalized,
+        year=year,
+        month=month,
+        peer_model=DrawingIssuePlan,
+        existing_nos=prior_nos,
+    )
+
     DesignDrawingIssuePlan.query.filter_by(year=year, month=month).delete()
     saved: list[dict] = []
     for payload in sorted(normalized, key=lambda item: item["seq"]):
@@ -176,8 +228,12 @@ def batch_replace_month_plans(records: list[dict]) -> tuple[list[dict] | None, s
             project_name=payload["project_name"],
             project_no=payload["project_no"],
             component_weight_kg=payload["component_weight_kg"],
-            planned_issue_date=payload["planned_issue_date"],
-            actual_issue_date=payload["actual_issue_date"],
+            design_planned_issue_date=payload["design_planned_issue_date"],
+            design_actual_issue_date=payload["design_actual_issue_date"],
+            tile_layout_planned_issue_date=payload["tile_layout_planned_issue_date"],
+            tile_layout_actual_issue_date=payload["tile_layout_actual_issue_date"],
+            floor_deck_planned_issue_date=payload["floor_deck_planned_issue_date"],
+            floor_deck_actual_issue_date=payload["floor_deck_actual_issue_date"],
             material_prep_list_issue_date=payload["material_prep_list_issue_date"],
             remark=payload["remark"],
             created_at=now,
@@ -186,8 +242,20 @@ def batch_replace_month_plans(records: list[dict]) -> tuple[list[dict] | None, s
         db.session.add(row)
         saved.append(row.to_dict())
 
+    sync_floor_deck_to_peer(
+        normalized,
+        year=year,
+        month=month,
+        peer_model=DrawingIssuePlan,
+    )
     db.session.commit()
-    return saved, None, 200
+    return enrich_records_with_peer_floor_deck(
+        saved,
+        year=year,
+        month=month,
+        self_model=DesignDrawingIssuePlan,
+        peer_model=DrawingIssuePlan,
+    ), None, 200
 
 
 def _parse_title_year_month(title: str) -> tuple[int | None, int | None]:
@@ -207,21 +275,70 @@ def _is_total_row(values: list[Any]) -> bool:
     return any(marker in first for marker in _TOTAL_MARKERS)
 
 
-def _find_header_index(headers: list[str], *markers: str) -> int | None:
+def _find_header_index(
+    headers: list[str],
+    *markers: str,
+    exclude: tuple[str, ...] = (),
+) -> int | None:
     for index, header in enumerate(headers):
+        if exclude and any(token in header for token in exclude):
+            continue
         if any(marker in header for marker in markers):
             return index
     return None
 
 
-def _parse_import_row(values: list[Any], headers: list[str] | None, target_year: int, target_month: int, seq: int) -> dict | None:
-    project_name_index = _find_header_index(headers or [], "项目名称") if headers else 1
-    project_no_index = _find_header_index(headers or [], "项目编号") if headers else 2
-    weight_index = _find_header_index(headers or [], "构件重量", "重量") if headers else 3
-    prep_list_index = _find_header_index(headers or [], "备料清单") if headers else None
-    planned_index = _find_header_index(headers or [], "计划发图") if headers else 4
-    actual_index = _find_header_index(headers or [], "实际发图") if headers else None
-    remark_index = _find_header_index(headers or [], "备注") if headers else 5
+def _cell_value(values: list[Any], index: int | None) -> Any:
+    if index is None or index < 0 or len(values) <= index:
+        return None
+    return values[index]
+
+
+def _parse_import_row(
+    values: list[Any],
+    headers: list[str] | None,
+    target_year: int,
+    target_month: int,
+    seq: int,
+) -> dict | None:
+    if headers:
+        project_name_index = _find_header_index(headers, "项目名称")
+        project_no_index = _find_header_index(headers, "项目编号")
+        weight_index = _find_header_index(headers, "构件重量", "重量")
+        prep_list_index = _find_header_index(headers, "备料清单")
+        design_planned_index = _find_header_index(headers, "设计计划发图")
+        design_actual_index = _find_header_index(headers, "设计实际发图")
+        tile_planned_index = _find_header_index(headers, "排瓦计划发图")
+        tile_actual_index = _find_header_index(headers, "排瓦实际发图")
+        floor_deck_planned_index = _find_header_index(headers, "排楼承板计划发图")
+        floor_deck_actual_index = _find_header_index(headers, "排楼承板实际发图")
+        remark_index = _find_header_index(headers, "备注")
+
+        # 兼容旧表头「计划发图」/「实际发图」→ 映射到设计发图日期
+        if design_planned_index is None:
+            design_planned_index = _find_header_index(
+                headers,
+                "计划发图",
+                exclude=("排瓦", "排楼承板", "细化", "设计"),
+            )
+        if design_actual_index is None:
+            design_actual_index = _find_header_index(
+                headers,
+                "实际发图",
+                exclude=("排瓦", "排楼承板", "细化", "设计"),
+            )
+    else:
+        project_name_index = 1
+        project_no_index = 2
+        weight_index = 3
+        prep_list_index = 4
+        design_planned_index = 5
+        design_actual_index = 6
+        tile_planned_index = 7
+        tile_actual_index = 8
+        floor_deck_planned_index = 9
+        floor_deck_actual_index = 10
+        remark_index = 11
 
     if project_name_index is None:
         project_name_index = 1
@@ -229,25 +346,22 @@ def _parse_import_row(values: list[Any], headers: list[str] | None, target_year:
         project_no_index = 2
     if weight_index is None:
         weight_index = 3
-    if planned_index is None:
-        planned_index = 5 if prep_list_index is not None else 4
-    if prep_list_index is None and headers is None:
-        prep_list_index = 4
     if remark_index is None:
-        if actual_index is not None:
-            remark_index = 7 if prep_list_index is not None else 6
-        else:
-            remark_index = 6 if prep_list_index is not None else 5
+        remark_index = len(values) - 1 if values else 11
 
-    project_name = str(values[project_name_index] or "").strip() if len(values) > project_name_index else ""
-    project_no = str(values[project_no_index] or "").strip() if len(values) > project_no_index else ""
+    project_name = str(_cell_value(values, project_name_index) or "").strip()
+    project_no = str(_cell_value(values, project_no_index) or "").strip()
     if not project_name and not project_no:
         return None
 
     seq_value = values[0] if values else seq
     parsed_seq = int(seq_value) if str(seq_value).strip().isdigit() else seq
 
-    weight_header = headers[weight_index] if headers and weight_index is not None and len(headers) > weight_index else ""
+    weight_header = (
+        headers[weight_index]
+        if headers and weight_index is not None and len(headers) > weight_index
+        else ""
+    )
     weight_in_tons = _is_weight_header_in_tons(weight_header)
 
     return {
@@ -257,15 +371,17 @@ def _parse_import_row(values: list[Any], headers: list[str] | None, target_year:
         "projectName": project_name,
         "projectNo": project_no,
         "componentWeightKg": _normalize_imported_weight(
-            values[weight_index] if len(values) > weight_index else None,
+            _cell_value(values, weight_index),
             in_tons=weight_in_tons,
         ),
-        "materialPrepListIssueDate": _normalize_date(
-            values[prep_list_index] if prep_list_index is not None and len(values) > prep_list_index else None
-        ),
-        "plannedIssueDate": _normalize_date(values[planned_index] if len(values) > planned_index else None),
-        "actualIssueDate": _normalize_date(values[actual_index] if actual_index is not None and len(values) > actual_index else None),
-        "remark": str(values[remark_index] or "").strip() if len(values) > remark_index else "",
+        "materialPrepListIssueDate": _normalize_date(_cell_value(values, prep_list_index)),
+        "designPlannedIssueDate": _normalize_date(_cell_value(values, design_planned_index)),
+        "designActualIssueDate": _normalize_date(_cell_value(values, design_actual_index)),
+        "tileLayoutPlannedIssueDate": _normalize_date(_cell_value(values, tile_planned_index)),
+        "tileLayoutActualIssueDate": _normalize_date(_cell_value(values, tile_actual_index)),
+        "floorDeckPlannedIssueDate": _normalize_date(_cell_value(values, floor_deck_planned_index)),
+        "floorDeckActualIssueDate": _normalize_date(_cell_value(values, floor_deck_actual_index)),
+        "remark": str(_cell_value(values, remark_index) or "").strip(),
     }
 
 
@@ -327,7 +443,8 @@ def export_design_drawing_issue_plan_excel(year: int, month: int) -> bytes:
     worksheet.title = "设计发图计划"
 
     title = f"设备技术部{year}年{month}月钢构设计发图计划"
-    headers = ["序号", "项目名称", "项目编号", "构件重量/吨", "备料清单", "计划发图时间", "实际发图时间", "备注"]
+    headers = list(_EXPORT_HEADERS)
+    last_col = len(headers)
 
     thin_border = Border(
         left=Side(style="thin"),
@@ -340,7 +457,7 @@ def export_design_drawing_issue_plan_excel(year: int, month: int) -> bytes:
     header_font = Font(name="宋体", size=11, bold=True)
     body_font = Font(name="宋体", size=11)
 
-    worksheet.merge_cells("A1:H1")
+    worksheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
     title_cell = worksheet["A1"]
     title_cell.value = title
     title_cell.font = title_font
@@ -352,6 +469,7 @@ def export_design_drawing_issue_plan_excel(year: int, month: int) -> bytes:
         cell.alignment = center
         cell.border = thin_border
 
+    center_cols = {1, 4, 5, 6, 7, 8, 9, 10, 11}
     total_weight_kg = 0.0
     for index, record in enumerate(records, start=1):
         row_num = index + 2
@@ -363,14 +481,18 @@ def export_design_drawing_issue_plan_excel(year: int, month: int) -> bytes:
             record.project_no,
             _kg_to_tons(record.component_weight_kg),
             record.material_prep_list_issue_date,
-            record.planned_issue_date,
-            record.actual_issue_date,
+            record.design_planned_issue_date,
+            record.design_actual_issue_date,
+            record.tile_layout_planned_issue_date,
+            record.tile_layout_actual_issue_date,
+            record.floor_deck_planned_issue_date,
+            record.floor_deck_actual_issue_date,
             record.remark or "",
         ]
         for col, value in enumerate(values, start=1):
             cell = worksheet.cell(row=row_num, column=col, value=value)
             cell.font = body_font
-            cell.alignment = center if col in (1, 4, 5, 6, 7) else Alignment(vertical="center")
+            cell.alignment = center if col in center_cols else Alignment(vertical="center")
             cell.border = thin_border
 
     total_row = len(records) + 3
@@ -386,7 +508,11 @@ def export_design_drawing_issue_plan_excel(year: int, month: int) -> bytes:
     worksheet.column_dimensions["E"].width = 16
     worksheet.column_dimensions["F"].width = 16
     worksheet.column_dimensions["G"].width = 16
-    worksheet.column_dimensions["H"].width = 18
+    worksheet.column_dimensions["H"].width = 16
+    worksheet.column_dimensions["I"].width = 16
+    worksheet.column_dimensions["J"].width = 18
+    worksheet.column_dimensions["K"].width = 18
+    worksheet.column_dimensions["L"].width = 18
 
     buffer = io.BytesIO()
     workbook.save(buffer)

@@ -41,7 +41,15 @@ def register_read_write_guard(
     view_codes: tuple[str, ...],
     read_codes: tuple[str, ...] | None = None,
     my_write_codes: tuple[str, ...] = (),
+    restricted_get_suffixes: tuple[str, ...] = (),
 ) -> None:
+    """读写权限守卫。
+
+    - 写操作（非 GET/HEAD）默认要求 view_codes
+    - 读操作默认可用 read_codes（未传则同 view_codes）
+    - restricted_get_suffixes 命中的读路径仍只用 view_codes（如导出）
+    """
+
     @blueprint.before_request
     def _guard():
         if request.method == "OPTIONS":
@@ -52,11 +60,14 @@ def register_read_write_guard(
         if not personnel_id:
             return None
 
+        path = request.path or ""
         if request.method in ("GET", "HEAD"):
-            allowed_codes = list(read_codes or view_codes)
+            if any(path.rstrip("/").endswith(suffix.rstrip("/")) for suffix in restricted_get_suffixes):
+                allowed_codes = list(view_codes)
+            else:
+                allowed_codes = list(read_codes or view_codes)
         else:
             allowed_codes = list(view_codes)
-            path = request.path or ""
             if my_write_codes and ("/detail-workflow" in path or "/design-workflow" in path):
                 allowed_codes.extend(my_write_codes)
 

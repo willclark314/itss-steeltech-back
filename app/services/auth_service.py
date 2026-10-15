@@ -4,11 +4,20 @@ from flask import current_app
 from flask_jwt_extended import create_access_token, get_jwt, get_jwt_identity
 
 from steeltech_db.extensions import db
-from steeltech_db.models import AccountPassword, Personnel, Role, RolePersonnel
+from steeltech_db.models import AccountPassword, Personnel, Role
 from app.services import permission_service
-from steeltech_db.seed import DEV_USER_PROFILES
+from app.services.role_binding_service import get_personnel_role_ids
+from steeltech_db.seed import DEV_USER_PROFILES, resolve_dev_personnel_id
 
 DEV_USERNAMES = frozenset({"admin", "user"})
+
+
+def _resolve_dev_login_personnel_id(account: str, profile: dict) -> str:
+    """DEV 账号 JWT 必须使用库中真实 personnel.id，否则权限守卫会按幽灵 ID 判 403。"""
+    resolved = resolve_dev_personnel_id(profile)
+    if resolved:
+        return resolved
+    return profile.get("id", "")
 
 
 def get_account_password(account: str) -> str:
@@ -74,7 +83,7 @@ def get_dev_user_profile(account: str) -> dict | None:
         "passportExpiry": "",
         "position": base.get("position", ""),
         "nationality": "中国",
-        "workshop": "钢结构技术科",
+        "workshop": base.get("workshop", "开发人员"),
         "team": base["team"],
         "birthDate": "",
         "age": 0,
@@ -94,10 +103,13 @@ def get_dev_user_profile(account: str) -> dict | None:
 
 def get_personnel_role_codes(personnel_id: str) -> list[str]:
     """获取人员拥有的角色编码列表"""
+    role_ids = get_personnel_role_ids(personnel_id)
+    if not role_ids:
+        return []
     rows = (
         db.session.query(Role.code)
-        .join(RolePersonnel, Role.id == RolePersonnel.role_id)
-        .filter(RolePersonnel.personnel_id == personnel_id, Role.status == "active")
+        .filter(Role.id.in_(role_ids), Role.status == "active")
+        .order_by(Role.code)
         .all()
     )
     return [row.code for row in rows]
@@ -114,14 +126,26 @@ def login(username: str, password: str) -> tuple[dict | None, str | None, int]:
         profile = get_dev_user_profile(account)
         if profile is None:
             return None, "开发账号配置缺失", 500
+        personnel_id = _resolve_dev_login_personnel_id(account, profile)
         token = create_access_token(
             identity=account,
-            additional_claims={"login_type": "dev", "personnel_id": profile["id"]},
+            additional_claims={"login_type": "dev", "personnel_id": personnel_id},
         )
-        dev_roles = ["admin"] if account == "admin" else ["detailer"]
-        dev_permissions = permission_service.get_permission_codes_for_role_codes(dev_roles)
+        # 优先按库中角色取权限；人员尚未绑定时再回退到 DEV 默认角色码
+        db_roles = get_personnel_role_codes(personnel_id) if personnel_id else []
+        if db_roles:
+            dev_roles = db_roles
+            dev_permissions = permission_service.get_personnel_permission_codes(personnel_id)
+        else:
+            dev_roles = ["admin"] if account == "admin" else ["detailer"]
+            dev_permissions = permission_service.get_permission_codes_for_role_codes(dev_roles)
         user = build_login_user(
-            account, "dev", profile, roles=dev_roles, permissions=dev_permissions
+            account,
+            "dev",
+            profile,
+            personnel_id=personnel_id,
+            roles=dev_roles,
+            permissions=dev_permissions,
         )
         return {"token": token, "user": user}, None, 200
 
@@ -176,11 +200,24 @@ def get_current_user() -> tuple[dict | None, str | None, int]:
         profile = get_dev_user_profile(str(account))
         if profile is None:
             return None, "开发账号配置缺失", 500
-        dev_roles = ["admin"] if str(account) == "admin" else ["detailer"]
-        dev_permissions = permission_service.get_permission_codes_for_role_codes(dev_roles)
+        personnel_id = (claims.get("personnel_id") or "").strip() or _resolve_dev_login_personnel_id(
+            str(account), profile
+        )
+        db_roles = get_personnel_role_codes(personnel_id) if personnel_id else []
+        if db_roles:
+            dev_roles = db_roles
+            dev_permissions = permission_service.get_personnel_permission_codes(personnel_id)
+        else:
+            dev_roles = ["admin"] if str(account) == "admin" else ["detailer"]
+            dev_permissions = permission_service.get_permission_codes_for_role_codes(dev_roles)
         return {
             "user": build_login_user(
-                str(account), "dev", profile, roles=dev_roles, permissions=dev_permissions
+                str(account),
+                "dev",
+                profile,
+                personnel_id=personnel_id,
+                roles=dev_roles,
+                permissions=dev_permissions,
             )
         }, None, 200
 

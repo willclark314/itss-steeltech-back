@@ -6,16 +6,21 @@ from flask import Blueprint, jsonify, request
 
 from app.services import folder_template_service, path_search_service, system_config_service
 from app.services.folder_template_service import FolderTemplateError
+from app.services.permission_service import personnel_has_any_permission
 from app.utils.network_host import get_local_ipv4_addresses, list_host_drives
 from app.utils.paths import build_full_path, normalize_access_path, normalize_relative_path
-from app.utils.route_permissions import register_read_write_guard
+from app.utils.route_permissions import _resolve_personnel_id
 
 system_bp = Blueprint("system", __name__)
 
-register_read_write_guard(
-    system_bp,
-    view_codes=("system-settings:view",),
-)
+
+@system_bp.before_request
+def _require_login():
+    """项目页也会调用 config / path-exists 等，仅要求登录；改配置另做权限校验。"""
+    if request.method == "OPTIONS":
+        return None
+    _, error_response = _resolve_personnel_id()
+    return error_response
 
 
 def _normalize_full_path(path: str) -> str:
@@ -30,6 +35,13 @@ def _normalize_full_path(path: str) -> str:
 @system_bp.route("/config", methods=["GET", "PUT"])
 def system_config():
     if request.method == "PUT":
+        personnel_id, error_response = _resolve_personnel_id()
+        if error_response:
+            return error_response
+        if not personnel_id or not personnel_has_any_permission(
+            personnel_id, ["system-settings:view"]
+        ):
+            return jsonify({"message": "无权访问该资源"}), 403
         data = request.get_json(silent=True) or {}
         try:
             local_work_path = system_config_service.save_local_work_path_config(data)

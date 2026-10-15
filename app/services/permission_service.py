@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from steeltech_db.extensions import db
-from steeltech_db.models import Permission, Role, RolePermission, RolePersonnel
+from steeltech_db.models import Permission, Role, RolePermission
+
+from app.services.role_binding_service import get_personnel_role_ids, personnel_has_role_code
 
 ADMIN_ROLE_CODE = "admin"
 
@@ -14,17 +16,7 @@ def get_all_permission_codes() -> list[str]:
 def _is_admin_personnel(personnel_id: str) -> bool:
     if not personnel_id:
         return False
-    return (
-        db.session.query(RolePersonnel.role_id)
-        .join(Role, Role.id == RolePersonnel.role_id)
-        .filter(
-            RolePersonnel.personnel_id == personnel_id,
-            Role.code == ADMIN_ROLE_CODE,
-            Role.status == "active",
-        )
-        .first()
-        is not None
-    )
+    return personnel_has_role_code(personnel_id, ADMIN_ROLE_CODE)
 
 
 def get_permission_codes_for_role_codes(role_codes: list[str]) -> list[str]:
@@ -52,12 +44,14 @@ def get_personnel_permission_codes(personnel_id: str) -> list[str]:
     if _is_admin_personnel(personnel_id):
         return get_all_permission_codes()
 
+    role_ids = get_personnel_role_ids(personnel_id)
+    if not role_ids:
+        return []
+
     rows = (
         db.session.query(Permission.code)
         .join(RolePermission, RolePermission.permission_id == Permission.id)
-        .join(Role, Role.id == RolePermission.role_id)
-        .join(RolePersonnel, RolePersonnel.role_id == Role.id)
-        .filter(RolePersonnel.personnel_id == personnel_id, Role.status == "active")
+        .filter(RolePermission.role_id.in_(role_ids))
         .distinct()
         .order_by(Permission.code)
         .all()

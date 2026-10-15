@@ -8,7 +8,7 @@ contacts_bp = Blueprint("contacts", __name__)
 
 register_read_write_guard(
     contacts_bp,
-    view_codes=("contact-browse:view", "contact:view", "my:view"),
+    view_codes=("contact-browse:view", "contact:view", "production-contact:view", "my:view"),
 )
 
 

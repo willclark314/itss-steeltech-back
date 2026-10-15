@@ -96,8 +96,8 @@ if ($Init -or $Reset) {
     }
 }
 
-Write-Host "启动后端: http://localhost:5000"
-Write-Host "健康检查: http://localhost:5000/api/health"
+Write-Host "启动后端: http://127.0.0.1:5000 （仅本机可访问）"
+Write-Host "健康检查: http://127.0.0.1:5000/api/health"
 Write-Host ""
 
 # run.py → create_app() 会自动完成:

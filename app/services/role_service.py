@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from steeltech_db.extensions import db
-from steeltech_db.models import Permission, Personnel, Role, RolePermission, RolePersonnel
+from steeltech_db.models import Permission, Personnel, Role, RolePermission, RolePersonnel, RoleWorkshop
 
-
+from app.services.personnel_service import DEFAULT_WORKSHOP, WORKSHOP_DEV
+from app.services.role_binding_service import normalize_workshop
 from steeltech_db.permission_catalog import sort_permissions
 
 
@@ -28,9 +29,32 @@ def get_role_personnel(role_id: str) -> list[dict]:
     return [{"id": row.id, "name": row.name, "team": row.team} for row in rows]
 
 
+def get_role_workshops(role_id: str) -> list[str]:
+    rows = (
+        RoleWorkshop.query.filter_by(role_id=role_id)
+        .order_by(RoleWorkshop.workshop)
+        .all()
+    )
+    return [row.workshop for row in rows]
+
+
+def _get_allowed_workshops() -> set[str]:
+    allowed = {DEFAULT_WORKSHOP, WORKSHOP_DEV, ""}
+    rows = (
+        db.session.query(Personnel.workshop)
+        .filter(Personnel.status == "active")
+        .distinct()
+        .all()
+    )
+    for row in rows:
+        allowed.add(normalize_workshop(row.workshop))
+    return allowed
+
+
 def map_role(row: Role) -> dict:
     permissions = get_role_permissions(row.id)
     assigned = get_role_personnel(row.id)
+    workshops = get_role_workshops(row.id)
     return {
         "id": row.id,
         "name": row.name,
@@ -39,6 +63,7 @@ def map_role(row: Role) -> dict:
         "status": row.status,
         "permissionIds": [item["id"] for item in permissions],
         "permissions": permissions,
+        "assignedWorkshops": workshops,
         "assignedPersonnelIds": [item["id"] for item in assigned],
         "assignedPersonnel": assigned,
     }
@@ -58,6 +83,9 @@ def list_roles(*, keyword: str = "", status: str = "") -> list[dict]:
         if status and item["status"] != status:
             continue
         if keyword:
+            workshop_labels = [
+                "未分配科室" if not workshop else workshop for workshop in item["assignedWorkshops"]
+            ]
             searchable = " ".join(
                 [
                     item["id"],
@@ -68,6 +96,7 @@ def list_roles(*, keyword: str = "", status: str = "") -> list[dict]:
                         f"{permission['name']} {permission['code']}"
                         for permission in item["permissions"]
                     ],
+                    *workshop_labels,
                     *[
                         f"{person['name']} {person['team']}"
                         for person in item["assignedPersonnel"]
@@ -104,6 +133,24 @@ def normalize_assigned_personnel_ids(ids: list[str] | None) -> tuple[list[str] |
     return unique, None
 
 
+def normalize_assigned_workshops(workshops: list[str] | None) -> tuple[list[str] | None, str | None]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in workshops or []:
+        normalized = normalize_workshop(item)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+
+    allowed = _get_allowed_workshops()
+    for workshop in unique:
+        if workshop not in allowed:
+            label = "未分配科室" if workshop == "" else workshop
+            return None, f"科室「{label}」不存在"
+    return unique, None
+
+
 def sync_role_permissions(role_id: str, permission_ids: list[str]) -> None:
     RolePermission.query.filter_by(role_id=role_id).delete()
     for permission_id in permission_ids:
@@ -115,6 +162,13 @@ def sync_role_personnel(role_id: str, personnel_ids: list[str]) -> None:
     RolePersonnel.query.filter_by(role_id=role_id).delete()
     for personnel_id in personnel_ids:
         db.session.add(RolePersonnel(role_id=role_id, personnel_id=personnel_id))
+    db.session.commit()
+
+
+def sync_role_workshops(role_id: str, workshops: list[str]) -> None:
+    RoleWorkshop.query.filter_by(role_id=role_id).delete()
+    for workshop in workshops:
+        db.session.add(RoleWorkshop(role_id=role_id, workshop=workshop))
     db.session.commit()
 
 
@@ -155,6 +209,10 @@ def create_role(payload: dict) -> tuple[dict | None, str | None, int]:
     if personnel_error:
         return None, personnel_error, 400
 
+    workshops, workshop_error = normalize_assigned_workshops(payload.get("assignedWorkshops"))
+    if workshop_error:
+        return None, workshop_error, 400
+
     role_id = (payload.get("id") or "").strip() or generate_role_id()
     if Role.query.get(role_id):
         return None, f"角色 {role_id} 已存在", 409
@@ -169,6 +227,7 @@ def create_role(payload: dict) -> tuple[dict | None, str | None, int]:
     db.session.add(role)
     sync_role_permissions(role_id, permission_ids or [])
     sync_role_personnel(role_id, personnel_ids or [])
+    sync_role_workshops(role_id, workshops or [])
     db.session.commit()
     return map_role(role), None, 201
 
@@ -205,12 +264,21 @@ def update_role(role_id: str, payload: dict) -> tuple[dict | None, str | None, i
     if personnel_error:
         return None, personnel_error, 400
 
+    if "assignedWorkshops" in payload:
+        raw_workshops = payload.get("assignedWorkshops") or []
+    else:
+        raw_workshops = get_role_workshops(role_id)
+    workshops, workshop_error = normalize_assigned_workshops(raw_workshops)
+    if workshop_error:
+        return None, workshop_error, 400
+
     role.name = name
     role.code = code
     role.description = (payload.get("description") or "").strip()
     role.status = (payload.get("status") or "").strip() or role.status
     sync_role_permissions(role_id, permission_ids or [])
     sync_role_personnel(role_id, personnel_ids or [])
+    sync_role_workshops(role_id, workshops or [])
     db.session.commit()
     return map_role(role), None, 200
 

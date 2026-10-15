@@ -12,7 +12,10 @@ from __future__ import annotations
 from datetime import date, datetime
 
 from steeltech_db.extensions import db
-from steeltech_db.models import Personnel, PersonnelLeaveEntry, PersonnelLeavePolicy, Role, RolePersonnel
+from steeltech_db.models import Personnel, PersonnelLeaveEntry, PersonnelLeavePolicy
+
+from app.services.personnel_service import DEFAULT_WORKSHOP
+from app.services.role_binding_service import personnel_has_role_code
 
 
 # ── 默认策略参数 ──
@@ -30,13 +33,7 @@ def _today() -> date:
 
 
 def _is_admin_personnel(personnel_id: str) -> bool:
-    admin_role = (
-        db.session.query(RolePersonnel)
-        .join(Role, Role.id == RolePersonnel.role_id)
-        .filter(RolePersonnel.personnel_id == personnel_id, Role.code == "admin")
-        .first()
-    )
-    return admin_role is not None
+    return personnel_has_role_code(personnel_id, "admin")
 
 
 def _can_access_personnel(
@@ -508,17 +505,26 @@ def get_calendar(
     if is_scoped and not scope_personnel_id:
         return _empty_calendar(year, today)
 
-    # 在职人员（非管理员仅查本人）
+    # 在职人员（非管理员仅查本人；管理员全量视图暂只纳入钢结构技术科）
     personnel_query = Personnel.query.filter_by(status="active")
     if scope_personnel_id:
         personnel_query = personnel_query.filter_by(id=scope_personnel_id)
+    else:
+        personnel_query = personnel_query.filter_by(workshop=DEFAULT_WORKSHOP)
     personnel_rows = personnel_query.order_by(Personnel.team, Personnel.name).all()
     personnel_list = [p.to_dict() for p in personnel_rows]
+    personnel_ids = [p.id for p in personnel_rows]
 
     # 策略
     policy_query = PersonnelLeavePolicy.query
     if scope_personnel_id:
         policy_query = policy_query.filter_by(personnel_id=scope_personnel_id)
+    elif personnel_ids:
+        policy_query = policy_query.filter(
+            PersonnelLeavePolicy.personnel_id.in_(personnel_ids)
+        )
+    else:
+        policy_query = policy_query.filter(False)
     policies = [p.to_dict() for p in policy_query.all()]
     if scope_personnel_id and not any(
         p["personnelId"] == scope_personnel_id for p in policies
@@ -534,6 +540,12 @@ def get_calendar(
     )
     if scope_personnel_id:
         entry_query = entry_query.filter_by(personnel_id=scope_personnel_id)
+    elif personnel_ids:
+        entry_query = entry_query.filter(
+            PersonnelLeaveEntry.personnel_id.in_(personnel_ids)
+        )
+    else:
+        entry_query = entry_query.filter(False)
     actual_entries = [
         e.to_dict() for e in entry_query.order_by(PersonnelLeaveEntry.start_date).all()
     ]
@@ -546,6 +558,12 @@ def get_calendar(
     )
     if scope_personnel_id:
         latest_query = latest_query.filter_by(personnel_id=scope_personnel_id)
+    elif personnel_ids:
+        latest_query = latest_query.filter(
+            PersonnelLeaveEntry.personnel_id.in_(personnel_ids)
+        )
+    else:
+        latest_query = latest_query.filter(False)
     # 按 end_date 取最晚，与入库先后无关
     all_latest_desc = latest_query.order_by(
         PersonnelLeaveEntry.personnel_id,
@@ -570,6 +588,12 @@ def get_calendar(
     )
     if scope_personnel_id:
         earliest_any_query = earliest_any_query.filter_by(personnel_id=scope_personnel_id)
+    elif personnel_ids:
+        earliest_any_query = earliest_any_query.filter(
+            PersonnelLeaveEntry.personnel_id.in_(personnel_ids)
+        )
+    else:
+        earliest_any_query = earliest_any_query.filter(False)
     for e in earliest_any_query.order_by(
         PersonnelLeaveEntry.personnel_id,
         PersonnelLeaveEntry.start_date,

@@ -13,8 +13,16 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from steeltech_db.extensions import db
-from steeltech_db.models import MonthlyRest, MonthlyRestLock, Personnel, Role, RolePersonnel
+from steeltech_db.models import MonthlyRest, MonthlyRestLock, Personnel
 from app.services.auth_scope import get_user_scope as resolve_user_scope, is_jwt_admin
+from app.services.role_binding_service import personnel_has_role_code
+
+_NATIONALITY_CHINA = "中国"
+_NATIONALITY_INDONESIA = "印度尼西亚"
+_INDONESIAN_REST_DAYS_MIN = 1
+_INDONESIAN_REST_DAYS_MAX = 4
+# 中国籍：周六/周日可选；每月额外最多 1 个非周末任意日
+_CHINESE_FLEX_WEEKDAY_MAX = 1
 
 
 def get_user_scope(personnel_id: str) -> dict:
@@ -54,13 +62,54 @@ def is_month_locked(*, year: int, month: int) -> bool:
 
 def _is_admin_personnel(personnel_id: str) -> bool:
     """检查某 personnel_id 是否为管理员（dev 账号在 JWT claim 中处理）"""
-    admin_role = (
-        db.session.query(RolePersonnel)
-        .join(Role, Role.id == RolePersonnel.role_id)
-        .filter(RolePersonnel.personnel_id == personnel_id, Role.code == "admin")
-        .first()
-    )
-    return admin_role is not None
+    return personnel_has_role_code(personnel_id, "admin")
+
+
+def _is_indonesian_personnel(personnel: Personnel | None) -> bool:
+    return bool(personnel and (personnel.nationality or "").strip() == _NATIONALITY_INDONESIA)
+
+
+def _get_personnel_by_id(personnel_id: str) -> Personnel | None:
+    return Personnel.query.get(personnel_id)
+
+
+def _validate_rest_days(
+    *,
+    personnel_id: str,
+    year: int,
+    month: int,
+    rest_days: list[str],
+) -> str | None:
+    """按国籍校验休息日；通过返回 None，否则返回错误信息。"""
+    person = _get_personnel_by_id(personnel_id)
+    is_indonesian = _is_indonesian_personnel(person)
+
+    if is_indonesian:
+        if len(rest_days) < _INDONESIAN_REST_DAYS_MIN or len(rest_days) > _INDONESIAN_REST_DAYS_MAX:
+            return (
+                f"印尼籍员工每月需选择 {_INDONESIAN_REST_DAYS_MIN}-{_INDONESIAN_REST_DAYS_MAX} 天休息"
+            )
+    else:
+        if not rest_days:
+            return None
+
+    flex_weekday_count = 0
+    for day_str in rest_days:
+        try:
+            d = datetime.strptime(day_str, "%Y-%m-%d").date()
+        except ValueError:
+            return f"日期格式无效: {day_str}"
+        if d.year != year or d.month != month:
+            return f"日期 {day_str} 不在 {year}年{month}月"
+        if not is_indonesian and d.weekday() not in (5, 6):
+            flex_weekday_count += 1
+
+    if not is_indonesian and flex_weekday_count > _CHINESE_FLEX_WEEKDAY_MAX:
+        return (
+            f"中国籍员工每月最多可额外选择 {_CHINESE_FLEX_WEEKDAY_MAX} 个非周末休息日"
+        )
+
+    return None
 
 
 def save_monthly_rest(data: dict) -> tuple[dict | None, str | None, int]:
@@ -90,16 +139,20 @@ def save_monthly_rest(data: dict) -> tuple[dict | None, str | None, int]:
         if not is_jwt_admin():
             return None, f"{year}年{month}月已定稿，员工无法再修改", 403
 
-    # 校验是否为周末
-    for day_str in rest_days:
-        try:
-            d = datetime.strptime(day_str, "%Y-%m-%d").date()
-        except ValueError:
-            return None, f"日期格式无效: {day_str}", 400
-        if d.year != year or d.month != month:
-            return None, f"日期 {day_str} 不在 {year}年{month}月", 400
-        if d.weekday() not in (5, 6):
-            return None, f"{day_str} 不是周六或周日，不能设为月休", 400
+    # 校验休息日（按国籍）
+    if rest_days:
+        validation_error = _validate_rest_days(
+            personnel_id=personnel_id,
+            year=year,
+            month=month,
+            rest_days=rest_days,
+        )
+        if validation_error:
+            return None, validation_error, 400
+    elif _is_indonesian_personnel(_get_personnel_by_id(personnel_id)):
+        return None, (
+            f"印尼籍员工每月需选择 {_INDONESIAN_REST_DAYS_MIN}-{_INDONESIAN_REST_DAYS_MAX} 天休息"
+        ), 400
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     existing = MonthlyRest.query.get(record_id)
@@ -167,15 +220,25 @@ def batch_save_monthly_rest(
         if editable_ids is not None and personnel_id not in editable_ids:
             continue
 
-        # 仅保留周末
+        # 过滤当月合法日期（国籍规则由 _validate_rest_days 校验）
         valid_days: list[str] = []
         for day_str in rest_days:
             try:
                 d = datetime.strptime(day_str, "%Y-%m-%d").date()
             except ValueError:
                 continue
-            if d.weekday() in (5, 6) and d.year == year and d.month == month:
-                valid_days.append(day_str)
+            if d.year != year or d.month != month:
+                continue
+            valid_days.append(day_str)
+
+        validation_error = _validate_rest_days(
+            personnel_id=personnel_id,
+            year=year,
+            month=month,
+            rest_days=valid_days,
+        )
+        if validation_error:
+            return None, validation_error, 400
 
         existing = MonthlyRest.query.get(record_id)
         if existing:
@@ -300,19 +363,109 @@ def _apply_cell_style(cell, font: Font | None = None, alignment: Alignment | Non
         cell.border = border
 
 
-def export_monthly_rest_excel(year: int, month: int) -> bytes:
+def _default_sunday_rest_days(year: int, month: int) -> list[str]:
+    """与前端一致：无月休记录时默认当月全部周日休息。"""
+    _, days_in_month = monthrange(year, month)
+    return [
+        date(year, month, day).strftime("%Y-%m-%d")
+        for day in range(1, days_in_month + 1)
+        if date(year, month, day).weekday() == 6
+    ]
+
+
+def _parse_rest_days(
+    rest_record: MonthlyRest | None,
+    year: int,
+    month: int,
+    *,
+    person: Personnel | None = None,
+) -> list[str]:
+    """解析休息日；无记录时中国籍回退为默认周日，印尼籍回退为空。"""
+    if rest_record is None:
+        if _is_indonesian_personnel(person):
+            return []
+        return _default_sunday_rest_days(year, month)
+    try:
+        days = (
+            json.loads(rest_record.rest_days)
+            if isinstance(rest_record.rest_days, str)
+            else rest_record.rest_days
+        )
+        if isinstance(days, list):
+            return days
+    except (json.JSONDecodeError, TypeError):
+        pass
+    if _is_indonesian_personnel(person):
+        return []
+    return _default_sunday_rest_days(year, month)
+
+
+def _filter_records_by_nationality(
+    records: list[tuple[MonthlyRest | None, Personnel]],
+    nationality: str | None,
+) -> list[tuple[MonthlyRest | None, Personnel]]:
+    if not nationality:
+        return records
+    target = nationality.strip()
+    return [
+        item for item in records if (item[1].nationality or "").strip() == target
+    ]
+
+
+def export_monthly_rest_excel(
+    year: int,
+    month: int,
+    *,
+    personnel_ids: list[str] | None = None,
+    nationality: str | None = None,
+) -> bytes:
     """
     生成月休计划 Excel 文件，返回字节流。
     格式参照 2026年4月调休汇总表（钢结构技术科）（定稿）.xlsx。
+    若传入 personnel_ids，则严格按该顺序导出（与页面表格行序/序号一致）。
+    若传入 nationality，则仅导出该国籍人员（中国 / 印度尼西亚）。
     """
     # ── 查询数据 ──
-    records = (
-        db.session.query(MonthlyRest, Personnel)
-        .join(Personnel, MonthlyRest.personnel_id == Personnel.id)
-        .filter(MonthlyRest.year == year, MonthlyRest.month == month, Personnel.status == "active")
-        .order_by(Personnel.team, Personnel.name)
-        .all()
-    )
+    if personnel_ids is not None:
+        # 按前端 tableRows 传入顺序排列，保证 Excel 序号与页面一致
+        if not personnel_ids:
+            records: list[tuple[MonthlyRest | None, Personnel]] = []
+        else:
+            people = (
+                Personnel.query.filter(
+                    Personnel.id.in_(personnel_ids),
+                    Personnel.status == "active",
+                ).all()
+            )
+            people_by_id = {p.id: p for p in people}
+            rest_rows = (
+                MonthlyRest.query.filter(
+                    MonthlyRest.year == year,
+                    MonthlyRest.month == month,
+                    MonthlyRest.personnel_id.in_(personnel_ids),
+                ).all()
+            )
+            rest_by_pid = {r.personnel_id: r for r in rest_rows}
+            records = []
+            for pid in personnel_ids:
+                person = people_by_id.get(pid)
+                if person is None:
+                    continue
+                records.append((rest_by_pid.get(pid), person))
+    else:
+        records = (
+            db.session.query(MonthlyRest, Personnel)
+            .join(Personnel, MonthlyRest.personnel_id == Personnel.id)
+            .filter(
+                MonthlyRest.year == year,
+                MonthlyRest.month == month,
+                Personnel.status == "active",
+            )
+            .order_by(Personnel.team, Personnel.name)
+            .all()
+        )
+
+    records = _filter_records_by_nationality(records, nationality)
 
     wb = Workbook()
     ws = wb.active
@@ -452,13 +605,7 @@ def export_monthly_rest_excel(year: int, month: int) -> bytes:
         row_am = data_start_row + idx * 2      # 上午行
         row_pm = data_start_row + idx * 2 + 1  # 下午行
 
-        rest_days: list[str] = []
-        try:
-            days = json.loads(rest_record.rest_days) if isinstance(rest_record.rest_days, str) else rest_record.rest_days
-            if isinstance(days, list):
-                rest_days = days
-        except (json.JSONDecodeError, TypeError):
-            pass
+        rest_days = _parse_rest_days(rest_record, year, month, person=person)
 
         # 将 rest_days 转为 day-of-month 的集合
         rest_day_numbers: set[int] = set()

@@ -13,6 +13,7 @@ register_read_write_guard(
     view_codes=(
         "project-browse:view",
         "project:view",
+        "production-project-browse:view",
         "my:view",
         "schedule:view",
         "design-team-schedule:view",
@@ -97,6 +98,15 @@ def delete_project(project_no: str):
 def put_design_workflow(project_no: str):
     data = request.get_json(silent=True) or {}
     result, error, status = project_service.save_design_workflow(project_no, data)
+    if error:
+        return jsonify({"message": error}), status
+    return jsonify(result), status
+
+
+@projects_bp.put("/<path:project_no>/design-workflow/design-area")
+def put_design_area(project_no: str):
+    data = request.get_json(silent=True) or {}
+    result, error, status = project_service.save_design_area(project_no, data)
     if error:
         return jsonify({"message": error}), status
     return jsonify(result), status

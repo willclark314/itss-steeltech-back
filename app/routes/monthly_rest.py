@@ -145,12 +145,29 @@ def export_monthly_rest():
     if month < 1 or month > 12:
         return jsonify({"message": "月份必须在 1-12 之间"}), 400
 
+    # 可选：仅导出页面当前显示的人员（逗号分隔的 personnelId）
+    personnel_ids_raw = request.args.get("personnelIds", "").strip()
+    personnel_ids: list[str] | None = None
+    if personnel_ids_raw:
+        personnel_ids = [pid.strip() for pid in personnel_ids_raw.split(",") if pid.strip()]
+
+    nationality = request.args.get("nationality", "").strip() or None
+    if nationality and nationality not in ("中国", "印度尼西亚"):
+        return jsonify({"message": "nationality 仅支持：中国、印度尼西亚"}), 400
+
     try:
-        excel_bytes = monthly_rest_service.export_monthly_rest_excel(year, month)
+        excel_bytes = monthly_rest_service.export_monthly_rest_excel(
+            year, month, personnel_ids=personnel_ids, nationality=nationality
+        )
     except Exception as e:
         return jsonify({"message": f"生成 Excel 失败: {str(e)}"}), 500
 
-    filename = f"{year}年{month}月调休汇总表（钢结构技术科）.xlsx"
+    nationality_label = ""
+    if nationality == "中国":
+        nationality_label = "（中国籍）"
+    elif nationality == "印度尼西亚":
+        nationality_label = "（印尼籍）"
+    filename = f"{year}年{month}月调休汇总表（钢结构技术科）{nationality_label}.xlsx"
     return Response(
         excel_bytes,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

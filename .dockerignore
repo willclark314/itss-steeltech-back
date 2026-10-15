@@ -17,5 +17,18 @@ dist/
 venv/
 .venv/
 .tools/
+.temp/
 
+# 业务数据走 steeltech-datas 卷 / sync-db，勿打进镜像
+datas/
+
+db/datas/*.db
+db/datas/*.db.*
+db/datas/exports/
+db/schema-history/
+
+scripts/
+tests/
+
+*.md
 README.md

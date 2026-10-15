@@ -1,12 +1,18 @@
 from pathlib import Path
 
-from dotenv import load_dotenv
 from flask import Flask, send_from_directory
+
+# 必须在导入 Config 之前加载 .env，否则类属性会按空环境解析成默认 SQLite
+from steeltech_db.config import load_backend_dotenv
+
+load_backend_dotenv()
 
 from app.config import Config
 from app.extensions import cors, jwt
 from app.routes.auth import auth_bp
 from app.routes.backup import backup_bp
+from app.routes.db_migrate import db_migrate_bp
+from app.routes.change_orders import change_orders_bp
 from app.routes.contacts import contacts_bp
 from app.routes.design_team_schedule import design_team_schedule_bp
 from app.routes.design_drawing_issue_plan import design_drawing_issue_plan_bp
@@ -23,13 +29,20 @@ from app.routes.system import system_bp
 from app.routes.tags import tags_bp
 from app.routes.temp_tasks import temp_tasks_bp
 from app.routes.director_interview import director_interview_bp
+from app.routes.monthly_training import monthly_training_bp
+from app.routes.file_system import file_system_bp
+from app.routes.project_models import project_models_bp
+from app.routes.settlement import settlement_bp
 from app.routes.weekly_meeting import weekly_meeting_bp
 from steeltech_db.extensions import db, migrate
-from steeltech_db.seed import bootstrap_sqlite_file, ensure_schema, seed_if_empty
+from steeltech_db.seed import bootstrap_sqlite_file, ensure_dev_users, ensure_schema, seed_if_empty
 
 
 def create_app(config_class: type[Config] = Config) -> Flask:
-    load_dotenv()
+    load_backend_dotenv()
+    # 再次按当前环境刷新，覆盖「先 import、后改环境变量」的场景
+    if hasattr(config_class, "refresh_from_env"):
+        config_class.refresh_from_env()
 
     app = Flask(__name__)
     app.config.from_object(config_class)
@@ -56,6 +69,7 @@ def create_app(config_class: type[Config] = Config) -> Flask:
     app.register_blueprint(design_drawing_issue_plan_bp, url_prefix="/api/design-drawing-issue-plan")
     app.register_blueprint(drawing_issue_plan_bp, url_prefix="/api/drawing-issue-plan")
     app.register_blueprint(contacts_bp, url_prefix="/api/contacts")
+    app.register_blueprint(change_orders_bp, url_prefix="/api/change-orders")
     app.register_blueprint(tags_bp, url_prefix="/api/tags")
     app.register_blueprint(temp_tasks_bp, url_prefix="/api/temp-tasks")
     app.register_blueprint(monthly_rest_bp, url_prefix="/api/monthly-rest")
@@ -63,8 +77,13 @@ def create_app(config_class: type[Config] = Config) -> Flask:
     app.register_blueprint(system_bp, url_prefix="/api/system")
     app.register_blueprint(navigation_bp, url_prefix="/api/system")
     app.register_blueprint(backup_bp, url_prefix="/api/system/backup")
+    app.register_blueprint(db_migrate_bp, url_prefix="/api/system/db-migrate")
+    app.register_blueprint(settlement_bp, url_prefix="/api/settlement")
+    app.register_blueprint(project_models_bp, url_prefix="/api/project-models")
     app.register_blueprint(weekly_meeting_bp, url_prefix="/api/weekly-meetings")
     app.register_blueprint(director_interview_bp, url_prefix="/api/director-interviews")
+    app.register_blueprint(monthly_training_bp, url_prefix="/api/monthly-trainings")
+    app.register_blueprint(file_system_bp, url_prefix="/api/file-system")
 
     @app.get("/api/health")
     def health():
@@ -115,9 +134,25 @@ def create_app(config_class: type[Config] = Config) -> Flask:
         normalized_path = file_path.replace("\\", "/")
         return send_from_directory(str(director_interview_image_root), normalized_path)
 
+    change_order_pdf_root = Path(app.config["CHANGE_ORDER_PDF_STORAGE_ROOT"])
+
+    @app.get("/api/change-order-pdfs/<path:file_path>")
+    def serve_change_order_pdfs(file_path: str):
+        normalized_path = file_path.replace("\\", "/")
+        return send_from_directory(str(change_order_pdf_root), normalized_path)
+
+    monthly_training_file_root = Path(app.config["MONTHLY_TRAINING_FILE_ROOT"])
+
+    @app.get("/api/monthly-training-files/<path:file_path>")
+    def serve_monthly_training_files(file_path: str):
+        normalized_path = file_path.replace("\\", "/")
+        return send_from_directory(str(monthly_training_file_root), normalized_path)
+
     with app.app_context():
         ensure_schema(app)
         seed_if_empty(app)
+        # 生产/开发均需保证 admin/user 对应人员与角色绑定存在
+        ensure_dev_users(app)
         # 初始化备份调度器（非阻塞）
         from app.services.backup_service import BackupService
         BackupService().init_scheduler(app)

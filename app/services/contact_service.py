@@ -12,7 +12,11 @@ from sqlalchemy import text
 
 from app.config import Config
 from app.services import tag_service
-from app.services.project_service import resolve_project_no
+from app.services.project_service import (
+    _contact_is_jiagongdan,
+    ensure_project_for_contact_link,
+    recompute_projects_is_jiagongdan,
+)
 from app.utils.sql_helpers import insert_ignore
 from steeltech_db.extensions import db
 from steeltech_db.models.contact import ContactForm, ContactFormPdf
@@ -22,9 +26,9 @@ from app.utils.pagination import ListPageQuery, compute_paginated_window
 
 CONTACT_LIST_ORDER = (
     "COALESCE(NULLIF(TRIM(cf.derived_family_max_date), ''), cf.received_date) DESC, "
-    "COALESCE((SELECT MAX(cfp.project_no) FROM contact_form_projects cfp "
-    "WHERE cfp.contact_form_id = cf.id), '') DESC, "
-    "cf.sort_order ASC, cf.id ASC"
+    "COALESCE(cf.root_id, cf.id) ASC, "
+    "cf.sort_order ASC, "
+    "cf.id ASC"
 )
 CONTACT_LIST_SELECT = "cf.*, COALESCE(NULLIF(TRIM(cf.derived_family_max_date), ''), cf.received_date) AS family_max_received_date"
 CONTACT_PDF_ROOT = Path(Config.CONTACT_PDF_STORAGE_ROOT)
@@ -44,12 +48,12 @@ def _now_local() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def recompute_family_max_date(contact_id: str) -> None:
-    """重新计算指定联系单所在 family 的所有成员的 derived_family_max_date。"""
-    contact = ContactForm.query.get(contact_id)
-    if contact is None:
+CHILD_RELATION_TYPES = {"supplement", "revision", "follow_up", "cancel"}
+
+
+def recompute_family_max_date_for_root(root_id: str) -> None:
+    if not root_id:
         return
-    root_id = contact.root_id or contact.id
     family = ContactForm.query.filter(
         (ContactForm.root_id == root_id) | (ContactForm.id == root_id),
         ContactForm.deleted_at == None,
@@ -63,6 +67,14 @@ def recompute_family_max_date(contact_id: str) -> None:
             max_date = rd
     for c in family:
         c.derived_family_max_date = max_date
+
+
+def recompute_family_max_date(contact_id: str) -> None:
+    """重新计算指定联系单所在 family 的所有成员的 derived_family_max_date。"""
+    contact = ContactForm.query.get(contact_id)
+    if contact is None:
+        return
+    recompute_family_max_date_for_root(contact.root_id or contact.id)
     db.session.commit()
 
 
@@ -70,11 +82,30 @@ def _generate_contact_id() -> str:
     now = datetime.now()
     prefix = f"DTP{now.strftime('%y%m%d')}"
     row = db.session.execute(
-        text("SELECT COUNT(*) AS count FROM contact_forms WHERE id LIKE :prefix"),
+        text(
+            """
+            SELECT id FROM contact_forms
+            WHERE id LIKE :prefix
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ),
         {"prefix": f"{prefix}%"},
     ).first()
-    count = int(row.count) if row else 0
-    return f"{prefix}{count + 1}"
+    start = 1
+    if row and row.id:
+        match = re.fullmatch(rf"{re.escape(prefix)}(\d+)", str(row.id))
+        if match:
+            start = int(match.group(1)) + 1
+    for seq in range(start, start + 10000):
+        candidate = f"{prefix}{seq}"
+        existing = ContactForm.query.filter_by(id=candidate).first()
+        if not existing:
+            return candidate
+        if existing.deleted_at:
+            _archive_deleted_contact_id(candidate)
+            return candidate
+    raise ValueError("无法生成联系单号，请稍后重试")
 
 
 def _is_processing_contact_id(contact_id: str) -> bool:
@@ -138,10 +169,39 @@ def _resolve_processing_contact_id(project_nos: list[str]) -> str:
     existing = _find_processing_contact_for_project(base)
     if existing:
         raise ValueError(f"项目 {base} 已有加工单")
-    conflict = ContactForm.query.filter_by(id=contact_id, deleted_at=None).first()
-    if conflict:
-        raise ValueError(f"项目 {base} 已有加工单")
+    _ensure_contact_id_available(contact_id)
     return contact_id
+
+
+def _build_archived_contact_id(contact_id: str) -> str:
+    base = f"{contact_id}__del_{int(datetime.now().timestamp())}"
+    candidate = base
+    suffix = 0
+    while ContactForm.query.filter_by(id=candidate).first():
+        suffix += 1
+        candidate = f"{base}_{suffix}"
+    return candidate
+
+
+def _archive_deleted_contact_id(contact_id: str) -> None:
+    existing = ContactForm.query.filter_by(id=contact_id).first()
+    if not existing or not existing.deleted_at:
+        return
+    _rename_contact_id(contact_id, _build_archived_contact_id(contact_id))
+
+
+def _ensure_contact_id_available(contact_id: str) -> None:
+    """占用联系单号：活跃记录冲突则报错；仅软删除记录则归档后释放编号。"""
+    normalized = (contact_id or "").strip()
+    if not normalized:
+        return
+    existing = ContactForm.query.filter_by(id=normalized).first()
+    if not existing:
+        return
+    if existing.deleted_at:
+        _archive_deleted_contact_id(normalized)
+        return
+    raise ValueError(f"联系单号 {normalized} 已存在")
 
 
 def _generate_pdf_id() -> str:
@@ -154,6 +214,118 @@ def _generate_cancellation_id() -> str:
 
 def _normalize_pdf_relative_path(file_path: str) -> str:
     return file_path.replace("\\", "/")
+
+
+def resolve_contact_pdf_abs_path(file_path: str, attachment_type: str) -> Path | None:
+    normalized = _normalize_pdf_relative_path(file_path or "").strip()
+    if not normalized:
+        return None
+    roots = (CONTACT_PDF_ROOT,) if attachment_type == "primary" else (
+        CONTACT_ATTACHMENT_ROOT,
+        CONTACT_PDF_ROOT,
+    )
+    for root in roots:
+        candidate = root / Path(normalized)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _collect_project_contact_material_files(
+    project_no: str,
+    *,
+    jiagongdan_only: bool = False,
+) -> list[dict]:
+    """返回项目关联联系单的正文 PDF 与补充附件，供归档目录复制。"""
+    normalized_project_no = (project_no or "").strip()
+    if not normalized_project_no:
+        return []
+
+    rows = db.session.execute(
+        text(
+            """
+            SELECT cf.id, cf.title, cf.content,
+                   pdf.file_path, pdf.attachment_type, pdf.is_current,
+                   pdf.original_file_name, pdf.file_name, pdf.created_at
+            FROM contact_form_projects cproj
+            INNER JOIN contact_forms cf ON cf.id = cproj.contact_form_id
+            INNER JOIN contact_form_pdfs pdf ON pdf.contact_form_id = cf.id
+            WHERE cproj.project_no = :project_no
+              AND cf.deleted_at IS NULL
+              AND pdf.deleted_at IS NULL
+            ORDER BY cf.id, pdf.attachment_type, pdf.sort_order, pdf.created_at
+            """
+        ),
+        {"project_no": normalized_project_no},
+    ).all()
+
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        if jiagongdan_only and not _contact_is_jiagongdan(row.id, row.title, row.content):
+            continue
+        bucket = grouped.setdefault(
+            row.id,
+            {"primaries": [], "supplements": []},
+        )
+        item = {
+            "contactFormId": row.id,
+            "attachmentType": row.attachment_type,
+            "filePath": row.file_path or "",
+            "fileName": (row.original_file_name or row.file_name or "").strip(),
+            "createdAt": row.created_at or "",
+            "isCurrent": bool(row.is_current),
+        }
+        if row.attachment_type == "primary":
+            bucket["primaries"].append(item)
+        else:
+            bucket["supplements"].append(item)
+
+    results: list[dict] = []
+    for contact_id, bucket in grouped.items():
+        primaries = sorted(
+            bucket["primaries"],
+            key=lambda entry: entry["createdAt"],
+            reverse=True,
+        )
+        if primaries:
+            current = next((entry for entry in primaries if entry["isCurrent"]), primaries[0])
+            abs_path = resolve_contact_pdf_abs_path(
+                current["filePath"],
+                "primary",
+            )
+            if abs_path:
+                results.append({
+                    "contactFormId": contact_id,
+                    "attachmentType": "primary",
+                    "sourcePath": abs_path,
+                    "fileName": current["fileName"] or abs_path.name,
+                })
+
+        for supplement in bucket["supplements"]:
+            abs_path = resolve_contact_pdf_abs_path(
+                supplement["filePath"],
+                "supplement",
+            )
+            if not abs_path:
+                continue
+            results.append({
+                "contactFormId": contact_id,
+                "attachmentType": "supplement",
+                "sourcePath": abs_path,
+                "fileName": supplement["fileName"] or abs_path.name,
+            })
+
+    return results
+
+
+def list_project_jiagongdan_material_files(project_no: str) -> list[dict]:
+    """返回项目关联加工单联系单的正文 PDF 与补充附件，供归档目录复制。"""
+    return _collect_project_contact_material_files(project_no, jiagongdan_only=True)
+
+
+def list_project_contact_material_files(project_no: str) -> list[dict]:
+    """返回项目关联全部联系单的正文 PDF 与补充附件，供细化归档目录复制。"""
+    return _collect_project_contact_material_files(project_no, jiagongdan_only=False)
 
 
 def _has_file_payload(file: dict | None) -> bool:
@@ -592,16 +764,16 @@ def get_contact_rank(where_clause: str, params: dict, contact_id: str) -> int | 
         text(
             f"""
             WITH ranked AS (
-              SELECT cf.id, ROW_NUMBER() OVER (ORDER BY {CONTACT_LIST_ORDER}) - 1 AS rank
+              SELECT cf.id, ROW_NUMBER() OVER (ORDER BY {CONTACT_LIST_ORDER}) - 1 AS row_rank
               FROM contact_forms cf
               {where_clause}
             )
-            SELECT `rank` FROM ranked WHERE id = :contact_id
+            SELECT row_rank FROM ranked WHERE id = :contact_id
             """
         ),
         {**params, "contact_id": contact_id},
     ).first()
-    return int(row.rank) if row else None
+    return int(row.row_rank) if row else None
 
 
 def list_contacts(
@@ -712,9 +884,24 @@ def list_contacts(
     }
 
 
-def _insert_project_links(contact_form_id: str, links: list[dict]) -> None:
+def _insert_project_links(
+    contact_form_id: str,
+    links: list[dict],
+    *,
+    fallback_name: str | None = None,
+    received_date: str | None = None,
+) -> None:
     for link in links:
-        resolved_project_no = resolve_project_no(link["projectNo"])
+        raw_project_no = str(link.get("projectNo") or "").strip()
+        if not raw_project_no:
+            continue
+        resolved_project_no = ensure_project_for_contact_link(
+            raw_project_no,
+            name=fallback_name,
+            received_date=received_date,
+        )
+        if not resolved_project_no:
+            continue
         db.session.execute(
             text(
                 insert_ignore("contact_form_projects", "contact_form_id, project_no, source_type, source_contact_form_id")
@@ -727,6 +914,21 @@ def _insert_project_links(contact_form_id: str, links: list[dict]) -> None:
                 "source_contact_form_id": link.get("sourceContactFormId"),
             },
         )
+
+
+def _project_nos_for_contact(contact_form_id: str) -> list[str]:
+    rows = db.session.execute(
+        text("SELECT project_no FROM contact_form_projects WHERE contact_form_id = :id"),
+        {"id": contact_form_id},
+    ).all()
+    return [row.project_no for row in rows if row.project_no]
+
+
+def _recompute_linked_project_flags(contact_form_id: str, extra_project_nos: list[str] | None = None) -> None:
+    project_nos = _project_nos_for_contact(contact_form_id)
+    if extra_project_nos:
+        project_nos.extend(extra_project_nos)
+    recompute_projects_is_jiagongdan(project_nos)
 
 
 def _insert_pdf_records(
@@ -876,12 +1078,7 @@ def create_contact(payload: dict) -> dict:
         if _is_processing_contact_id(requested_id):
             contact_id = _resolve_processing_contact_id(payload.get("projectNos") or [])
         else:
-            existing = db.session.execute(
-                ContactForm.query.get(contact_id),
-                {"id": requested_id},
-            ).first()
-            if existing:
-                raise ValueError(f"联系单号 {requested_id} 已存在")
+            _ensure_contact_id_available(requested_id)
             contact_id = requested_id
     else:
         contact_id = _generate_contact_id()
@@ -910,7 +1107,12 @@ def create_contact(payload: dict) -> dict:
         },
     )
     links = [{"projectNo": no, "sourceType": "own"} for no in payload.get("projectNos") or []]
-    _insert_project_links(contact_id, links)
+    _insert_project_links(
+        contact_id,
+        links,
+        fallback_name=str(payload.get("title") or ""),
+        received_date=str(payload.get("receivedDate") or ""),
+    )
     if "tagIds" in payload:
         tag_ids, tag_error = tag_service.normalize_tag_ids(payload.get("tagIds"))
         if tag_error:
@@ -919,6 +1121,7 @@ def create_contact(payload: dict) -> dict:
     _insert_pdf_records(contact_id, payload.get("primaryPdf"), payload.get("supplementFiles"), created_at)
     db.session.commit()
     recompute_family_max_date(contact_id)
+    _recompute_linked_project_flags(contact_id)
     return get_contact_by_id(contact_id)
 
 
@@ -947,26 +1150,226 @@ def _rename_contact_id(old_id: str, new_id: str) -> None:
         )
 
 
+def _get_live_contact_row(contact_id: str):
+    return db.session.execute(
+        text("SELECT * FROM contact_forms WHERE id = :id AND deleted_at IS NULL"),
+        {"id": contact_id},
+    ).first()
+
+
+def _list_subtree_ids(contact_id: str) -> list[str]:
+    ids = [contact_id]
+    queue = [contact_id]
+    seen = {contact_id}
+    while queue:
+        current = queue.pop(0)
+        rows = db.session.execute(
+            text(
+                "SELECT id FROM contact_forms WHERE parent_id = :parent_id AND deleted_at IS NULL"
+            ),
+            {"parent_id": current},
+        ).all()
+        for row in rows:
+            if row.id not in seen:
+                seen.add(row.id)
+                ids.append(row.id)
+                queue.append(row.id)
+    return ids
+
+
+def _resequence_family(root_id: str) -> None:
+    rows = db.session.execute(
+        text(
+            """
+            SELECT id
+            FROM contact_forms
+            WHERE root_id = :root_id AND deleted_at IS NULL
+            ORDER BY CASE WHEN parent_id IS NULL OR id = :root_id THEN 0 ELSE 1 END,
+                     sort_order ASC, id ASC
+            """
+        ),
+        {"root_id": root_id},
+    ).all()
+    for index, row in enumerate(rows):
+        db.session.execute(
+            text("UPDATE contact_forms SET sort_order = :sort_order WHERE id = :id"),
+            {"sort_order": index, "id": row.id},
+        )
+
+
+def _normalize_child_relation_type(relation_type: str | None, fallback: str = "supplement") -> str:
+    value = (relation_type or fallback or "supplement").strip()
+    if value not in CHILD_RELATION_TYPES:
+        return "supplement"
+    return value
+
+
+def _apply_parent_change(contact_id: str, parent_id: str | None, relation_type: str | None) -> str | None:
+    """调整主从关系。返回需要重算日期的旧 root_id（未变化则为 None）。"""
+    current_row = _get_live_contact_row(contact_id)
+    if not current_row:
+        raise ValueError("联系单不存在")
+    current = _row_to_dict(current_row)
+    old_root = (current.get("root_id") or contact_id).strip()
+    current_parent = (current.get("parent_id") or "").strip() or None
+    now = _now_local()
+
+    if not parent_id:
+        if not current_parent and (current.get("relation_type") or "primary") == "primary":
+            return None
+        subtree = _list_subtree_ids(contact_id)
+        db.session.execute(
+            text(
+                """
+                UPDATE contact_forms
+                SET parent_id = NULL, root_id = :root_id, relation_type = 'primary',
+                    sort_order = 0, cancel_scope = NULL, updated_at = :updated_at
+                WHERE id = :id
+                """
+            ),
+            {"root_id": contact_id, "updated_at": now, "id": contact_id},
+        )
+        for child_id in subtree:
+            if child_id == contact_id:
+                continue
+            db.session.execute(
+                text(
+                    """
+                    UPDATE contact_forms
+                    SET root_id = :root_id, updated_at = :updated_at
+                    WHERE id = :id
+                    """
+                ),
+                {"root_id": contact_id, "updated_at": now, "id": child_id},
+            )
+        db.session.execute(
+            text(
+                """
+                UPDATE contact_form_projects
+                SET source_type = 'own', source_contact_form_id = NULL
+                WHERE contact_form_id = :id AND source_type = 'inherited'
+                """
+            ),
+            {"id": contact_id},
+        )
+        if old_root != contact_id:
+            _resequence_family(old_root)
+        return old_root if old_root != contact_id else None
+
+    if parent_id == contact_id:
+        raise ValueError("不能将联系单追加到自身")
+    parent_row = _get_live_contact_row(parent_id)
+    if not parent_row:
+        raise ValueError("主单不存在")
+    parent = _row_to_dict(parent_row)
+    new_root = (parent.get("root_id") or parent_id).strip()
+    subtree = _list_subtree_ids(contact_id)
+    if parent_id in subtree:
+        raise ValueError("不能将联系单追加到自己的从单")
+
+    rel = _normalize_child_relation_type(relation_type, current.get("relation_type") or "supplement")
+    if current_parent == parent_id and old_root == new_root:
+        db.session.execute(
+            text(
+                """
+                UPDATE contact_forms
+                SET relation_type = :relation_type, updated_at = :updated_at
+                WHERE id = :id
+                """
+            ),
+            {"relation_type": rel, "updated_at": now, "id": contact_id},
+        )
+        return None
+
+    max_sort_row = db.session.execute(
+        text(
+            "SELECT COALESCE(MAX(sort_order), 0) AS max_sort "
+            "FROM contact_forms WHERE root_id = :root_id AND deleted_at IS NULL"
+        ),
+        {"root_id": new_root},
+    ).first()
+    max_sort = int(max_sort_row.max_sort) if max_sort_row else 0
+    new_sort = max_sort + 1
+    old_sort = int(current.get("sort_order") or 0)
+    offset = new_sort - old_sort
+
+    db.session.execute(
+        text(
+            """
+            UPDATE contact_forms
+            SET parent_id = :parent_id, root_id = :root_id, relation_type = :relation_type,
+                sort_order = :sort_order, updated_at = :updated_at
+            WHERE id = :id
+            """
+        ),
+        {
+            "parent_id": parent_id,
+            "root_id": new_root,
+            "relation_type": rel,
+            "sort_order": new_sort,
+            "updated_at": now,
+            "id": contact_id,
+        },
+    )
+    for child_id in subtree:
+        if child_id == contact_id:
+            continue
+        db.session.execute(
+            text(
+                """
+                UPDATE contact_forms
+                SET root_id = :root_id, sort_order = sort_order + :offset, updated_at = :updated_at
+                WHERE id = :id
+                """
+            ),
+            {"root_id": new_root, "offset": offset, "updated_at": now, "id": child_id},
+        )
+    _resequence_family(new_root)
+    if old_root != new_root:
+        _resequence_family(old_root)
+    return old_root if old_root != new_root else None
+
+
 def update_contact(contact_id: str, payload: dict) -> dict | None:
     existing = ContactForm.query.filter_by(id=contact_id, deleted_at=None).first()
     if not existing:
         return None
 
-    if "id" in payload and not _is_processing_contact_id(contact_id):
+    previous_project_nos = _project_nos_for_contact(contact_id)
+
+    if "id" in payload:
         new_id = str(payload.get("id", "")).strip()
         if not new_id:
             raise ValueError("联系单号不能为空")
-        if _is_processing_contact_id(new_id):
-            new_id = contact_id
+
+        was_processing = _is_processing_contact_id(contact_id)
+        wants_processing = _is_processing_contact_id(new_id)
+
+        if wants_processing:
+            if was_processing:
+                # 编辑加工单时前端可能仍传占位「加工单」，保持原号
+                new_id = contact_id
+            else:
+                # 普通联系单 → 加工单：按项目号生成 加工单-{项目号}
+                project_nos = payload.get("projectNos")
+                if not isinstance(project_nos, list) or not any(
+                    str(no).strip() for no in project_nos
+                ):
+                    project_nos = previous_project_nos
+                new_id = _resolve_processing_contact_id(project_nos)
+        # else: 加工单 → 普通联系单，或普通单改号，使用 payload 中的正式单号
+
         if new_id != contact_id:
-            conflict = db.session.execute(
-                ContactForm.query.get(contact_id),
-                {"id": new_id},
-            ).first()
-            if conflict:
-                raise ValueError(f"联系单号 {new_id} 已存在")
+            _ensure_contact_id_available(new_id)
             _rename_contact_id(contact_id, new_id)
             contact_id = new_id
+
+    extra_root_ids: list[str] = []
+    if "parentId" in payload:
+        parent_id = str(payload.get("parentId") or "").strip() or None
+        old_root = _apply_parent_change(contact_id, parent_id, payload.get("relationType"))
+        if old_root:
+            extra_root_ids.append(old_root)
 
     fields = []
     params: dict = {"id": contact_id, "updated_at": _now_local()}
@@ -979,6 +1382,8 @@ def update_contact(contact_id: str, payload: dict) -> dict | None:
         "relationType": "relation_type",
     }
     for key, column in mapping.items():
+        if key == "relationType" and "parentId" in payload:
+            continue
         if key in payload:
             fields.append(f"{column} = :{column}")
             params[column] = payload[key]
@@ -996,7 +1401,12 @@ def update_contact(contact_id: str, payload: dict) -> dict | None:
             {"id": contact_id},
         )
         links = [{"projectNo": no, "sourceType": "own"} for no in payload["projectNos"]]
-        _insert_project_links(contact_id, links)
+        _insert_project_links(
+            contact_id,
+            links,
+            fallback_name=str(payload.get("title") or existing.title or ""),
+            received_date=str(payload.get("receivedDate") or existing.received_date or ""),
+        )
 
     if "tagIds" in payload:
         tag_ids, tag_error = tag_service.normalize_tag_ids(payload.get("tagIds"))
@@ -1015,6 +1425,11 @@ def update_contact(contact_id: str, payload: dict) -> dict | None:
 
     db.session.commit()
     recompute_family_max_date(contact_id)
+    for root_id in extra_root_ids:
+        if root_id and root_id != contact_id:
+            recompute_family_max_date_for_root(root_id)
+            db.session.commit()
+    _recompute_linked_project_flags(contact_id, extra_project_nos=previous_project_nos)
     return get_contact_by_id(contact_id)
 
 
@@ -1222,12 +1637,7 @@ def create_child_contact(parent_id: str, payload: dict) -> dict | None:
                 project_nos = [str(row.project_no) for row in parent_links if row.project_no]
             contact_id = _resolve_processing_contact_id(project_nos)
         else:
-            existing = db.session.execute(
-                ContactForm.query.get(contact_id),
-                {"id": requested_id},
-            ).first()
-            if existing:
-                raise ValueError(f"联系单号 {requested_id} 已存在")
+            _ensure_contact_id_available(requested_id)
             contact_id = requested_id
     else:
         contact_id = _generate_contact_id()
@@ -1272,7 +1682,12 @@ def create_child_contact(parent_id: str, payload: dict) -> dict | None:
         relation_type,
         payload.get("cancelledProjectNos") or [],
     )
-    _insert_project_links(contact_id, project_links)
+    _insert_project_links(
+        contact_id,
+        project_links,
+        fallback_name=str(payload.get("title") or ""),
+        received_date=str(payload.get("receivedDate") or ""),
+    )
     _insert_pdf_records(contact_id, payload.get("primaryPdf"), payload.get("supplementFiles"), created_at)
 
     if relation_type == "cancel":
@@ -1284,6 +1699,10 @@ def create_child_contact(parent_id: str, payload: dict) -> dict | None:
         )
 
     db.session.commit()
+    _recompute_linked_project_flags(
+        contact_id,
+        extra_project_nos=[item["projectNo"] for item in project_links],
+    )
     return get_contact_by_id(contact_id)
 
 
@@ -1292,6 +1711,7 @@ def delete_contact(contact_id: str) -> bool:
     if not existing:
         return False
 
+    linked_project_nos = _project_nos_for_contact(contact_id)
     deleted_at = _now_local()
     _soft_delete_contact_pdfs(contact_id, deleted_at)
     db.session.execute(
@@ -1305,4 +1725,5 @@ def delete_contact(contact_id: str) -> bool:
         {"id": contact_id, "deleted_at": deleted_at, "updated_at": deleted_at},
     )
     db.session.commit()
+    recompute_projects_is_jiagongdan(linked_project_nos)
     return True

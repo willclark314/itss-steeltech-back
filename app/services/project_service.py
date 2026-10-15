@@ -15,20 +15,34 @@ from steeltech_db.project_split import (
 )
 from steeltech_db.project_status import (
     PROJECT_STATUS_ACTIVE,
+    PROJECT_STATUS_CANCELLED,
     PROJECT_STATUS_DONE,
     PROJECT_STATUS_LABELS,
+    PROJECT_STATUS_NOT_STARTED,
+    PROJECT_STATUS_PAUSED,
     VALID_PROJECT_STATUSES,
 )
 from app.services import design_workflow_service, detail_workflow_service, project_flow_filter, tag_service
 from app.utils.pagination import ListPageQuery, compute_paginated_window
 from app.utils.paths import normalize_relative_path
-from app.utils.sql_helpers import insert_ignore, now_expr
+from app.utils.sql_helpers import insert_ignore
 from app.utils.sql_mapper import mapper
 
 VALID_NATURES = frozenset(
     {"design", "detail", "detail_issue", "plate_layout", "floor_deck_layout", "tile_layout"}
 )
 DETAIL_GROUP_NATURES = frozenset({"detail", "detail_issue", "floor_deck_layout", "tile_layout"})
+VALID_STRUCTURE_TYPES = frozenset(
+    {
+        "门式钢架",
+        "支架",
+        "管桁架",
+        "钢平台",
+        "框架结构",
+        "型钢桁架",
+        "零星结构",
+    }
+)
 JIAGONGDAN_CONTENT_PATTERN = r"(?:^|\n)项目分类[：:]\s*.*加工单"
 JIAGONGDAN_CONTACT_ID_PATTERN = re.compile(r"^(?:加工单-|BRD\d{6}C\d{9}$)", re.IGNORECASE)
 
@@ -36,12 +50,31 @@ JIAGONGDAN_CONTACT_ID_PATTERN = re.compile(r"^(?:加工单-|BRD\d{6}C\d{9}$)", r
 def _is_jiagongdan_contact_id(contact_id: str) -> bool:
     return bool(JIAGONGDAN_CONTACT_ID_PATTERN.match((contact_id or "").strip()))
 
-PROJECT_RECEIVED_DATE_SQL = """COALESCE(
-    NULLIF(TRIM(p.derived_received_date), ''),
-    NULLIF(TRIM(p.planned_start_date), ''),
-    ''
-)"""
-PROJECT_LIST_ORDER = f"{PROJECT_RECEIVED_DATE_SQL} DESC, p.project_no DESC"
+PROJECT_LIST_ORDER = "p.derived_received_date DESC, p.project_no DESC"
+PROJECT_LIST_COLUMNS = """
+    p.project_no,
+    p.name,
+    p.customer,
+    p.status,
+    p.design_completed,
+    p.detail_completed,
+    p.tile_layout_completed,
+    p.floor_deck_layout_completed,
+    p.drawing_issue_enabled,
+    p.drawing_issue_year_month,
+    p.is_jiagongdan,
+    p.received_date,
+    p.derived_received_date,
+    p.planned_start_date,
+    p.planned_end_date,
+    p.actual_start_date,
+    p.actual_end_date,
+    p.design_work_path,
+    p.detail_work_path,
+    p.local_work_path,
+    p.structure_type,
+    p.estimated_weight_tons
+"""
 
 
 def recompute_derived_received_date(project_no: str) -> None:
@@ -63,6 +96,51 @@ def resolve_project_no(project_no: str) -> str:
     return parse_base_project_no((project_no or "").strip())
 
 
+def ensure_project_for_contact_link(
+    project_no: str,
+    *,
+    name: str | None = None,
+    received_date: str | None = None,
+) -> str:
+    """确保 projects 中存在对应行，避免 contact_form_projects 外键导致关联被静默忽略。
+
+    返回归一化后的业务项目号；输入为空时返回空字符串。
+    自动补建时项目名称优先使用联系主题，为空时回退为项目号。
+    """
+    resolved = resolve_project_no(project_no)
+    if not resolved:
+        return ""
+    if Project.query.get(resolved):
+        return resolved
+
+    project_name = (name or "").strip() or resolved
+    received = (received_date or "").strip()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.session.add(
+        Project(
+            project_no=resolved,
+            name=project_name,
+            customer="",
+            status=PROJECT_STATUS_ACTIVE,
+            design_completed=False,
+            detail_completed=False,
+            received_date=received,
+            derived_received_date=received or None,
+            planned_start_date=received,
+            planned_end_date="",
+            actual_start_date="",
+            actual_end_date="",
+            design_work_path="",
+            detail_work_path="",
+            local_work_path="",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.session.flush()
+    return resolved
+
+
 def _build_contact_links(project_no: str, contact_form_ids: list[str]) -> list[dict]:
     return [{"projectNo": project_no, "contactFormId": contact_id} for contact_id in contact_form_ids]
 
@@ -73,6 +151,30 @@ def normalize_project_status(value: str | None, *, default: str = "active") -> t
         labels = "、".join(PROJECT_STATUS_LABELS[code] for code in sorted(VALID_PROJECT_STATUSES))
         return None, f"项目状态无效，仅支持：{labels}"
     return status, None
+
+
+def normalize_structure_type(value) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    normalized = str(value).strip()
+    if not normalized:
+        return "", None
+    if normalized not in VALID_STRUCTURE_TYPES:
+        labels = "、".join(sorted(VALID_STRUCTURE_TYPES))
+        return None, f"结构形式无效，仅支持：{labels}"
+    return normalized, None
+
+
+def normalize_estimated_weight_tons(value) -> tuple[float | None, str | None]:
+    if value is None or value == "":
+        return None, None
+    try:
+        weight = float(value)
+    except (TypeError, ValueError):
+        return None, "预估重量格式无效"
+    if weight < 0:
+        return None, "预估重量不能为负数"
+    return round(weight, 3), None
 
 
 def normalize_completion_flag(value, *, default: bool = False) -> bool:
@@ -114,7 +216,15 @@ def get_contact_form_ids(project_no: str) -> list[str]:
     return [(row.contact_form_id or "").strip() for row in rows if row.contact_form_id]
 
 
-def get_project_is_jiagongdan(project_no: str) -> bool:
+def _contact_is_jiagongdan(contact_id: str, title: str, content: str) -> bool:
+    if _is_jiagongdan_contact_id(contact_id):
+        return True
+    if "加工单" in (title or ""):
+        return True
+    return bool(re.search(JIAGONGDAN_CONTENT_PATTERN, content or ""))
+
+
+def compute_project_is_jiagongdan(project_no: str) -> bool:
     rows = db.session.execute(
         text(
             """
@@ -122,22 +232,38 @@ def get_project_is_jiagongdan(project_no: str) -> bool:
             FROM contact_form_projects cfp
             INNER JOIN contact_forms cf ON cf.id = cfp.contact_form_id
             WHERE cfp.project_no = :project_no
+              AND cf.deleted_at IS NULL
             ORDER BY cf.id
             """
         ),
         {"project_no": project_no},
     ).all()
-    for row in rows:
-        contact_id = (row.id or "").strip()
-        title = (row.title or "").strip()
-        content = (row.content or "").strip()
-        if _is_jiagongdan_contact_id(contact_id):
-            return True
-        if "加工单" in title:
-            return True
-        if re.search(JIAGONGDAN_CONTENT_PATTERN, content):
-            return True
-    return False
+    return any(_contact_is_jiagongdan(row.id, row.title, row.content) for row in rows)
+
+
+def recompute_project_is_jiagongdan(project_no: str, *, commit: bool = True) -> None:
+    """按关联联系单重算并写入 projects.is_jiagongdan，供列表避免扫 content。"""
+    project = Project.query.get(project_no)
+    if project is None:
+        return
+    project.is_jiagongdan = compute_project_is_jiagongdan(project_no)
+    if commit:
+        db.session.commit()
+
+
+def recompute_projects_is_jiagongdan(project_nos: list[str]) -> None:
+    unique = list(dict.fromkeys(item.strip() for item in project_nos if item and str(item).strip()))
+    for project_no in unique:
+        recompute_project_is_jiagongdan(project_no, commit=False)
+    if unique:
+        db.session.commit()
+
+
+def get_project_is_jiagongdan(project_no: str) -> bool:
+    project = Project.query.get(project_no)
+    if project is None:
+        return False
+    return bool(project.is_jiagongdan)
 
 
 def get_project_natures(project_no: str) -> list[str]:
@@ -189,13 +315,21 @@ def map_project_dates(row: dict) -> dict:
     }
 
 
-def resolve_received_date(row: dict) -> str:
+def resolve_received_date(row: dict, *, allow_contact_lookup: bool = True) -> str:
+    """解析项目收件日期。
+
+    优先使用已落库的 derived_received_date，避免列表场景对联系单表 N+1 查询。
+    """
+    derived = (row.get("derived_received_date") or "").strip()
+    if derived:
+        return derived
     stored = (row.get("received_date") or "").strip()
     if stored:
         return stored
-    from_contacts = get_received_date_from_contacts(row["project_no"])
-    if from_contacts:
-        return from_contacts
+    if allow_contact_lookup:
+        from_contacts = get_received_date_from_contacts(row["project_no"])
+        if from_contacts:
+            return from_contacts
     dates = map_project_dates(row)
     return dates["plannedStartDate"]
 
@@ -223,21 +357,32 @@ def _map_detail_workflow_with_audit(row: ProjectDetailWorkflow | None) -> dict |
     return detail_workflow_service.map_detail_workflow(row, updated_by_name=updated_by_name)
 
 
+def _map_design_workflow_with_audit(row: ProjectDesignWorkflow | None) -> dict | None:
+    if row is None:
+        return None
+    updated_by_name = ""
+    if row.design_area_updated_by:
+        names = _get_personnel_names_by_ids([row.design_area_updated_by])
+        updated_by_name = names.get(row.design_area_updated_by, "")
+    return design_workflow_service.map_design_workflow(row, updated_by_name=updated_by_name)
+
+
 def map_project(row: dict) -> dict:
     project_no = row["project_no"]
-    contact_form_ids = get_contact_form_ids(project_no)
+    contact_map, urgent_map = _get_contact_ids_map([project_no])
+    contact_form_ids = contact_map.get(project_no, [])
     assigned = get_assigned_personnel(project_no)
     dates = map_project_dates(row)
-    is_jiagongdan = get_project_is_jiagongdan(project_no)
     design_work_path = normalize_relative_path(row.get("design_work_path") or "")
     detail_work_path = normalize_relative_path(row.get("detail_work_path") or "")
     legacy_local = normalize_relative_path(row.get("local_work_path") or "")
+    natures = get_project_natures(project_no)
     return {
         "projectNo": project_no,
         "baseProjectNo": project_no,
         "name": row["name"],
         "customer": row.get("customer") or "",
-        "isJiagongdan": is_jiagongdan,
+        "isJiagongdan": normalize_completion_flag(row.get("is_jiagongdan")),
         "status": row["status"],
         "designCompleted": normalize_completion_flag(row.get("design_completed")),
         "detailCompleted": normalize_completion_flag(row.get("detail_completed")),
@@ -245,7 +390,7 @@ def map_project(row: dict) -> dict:
         "floorDeckLayoutCompleted": normalize_completion_flag(row.get("floor_deck_layout_completed")),
         "drawingIssueEnabled": normalize_completion_flag(row.get("drawing_issue_enabled")),
         "drawingIssueYearMonth": (row.get("drawing_issue_year_month") or "").strip(),
-        "natures": get_project_natures(project_no),
+        "natures": natures,
         "tags": tag_service.get_project_tags(project_no),
         "assignedPersonnelIds": [item["id"] for item in assigned],
         "assignedPersonnel": assigned,
@@ -253,13 +398,18 @@ def map_project(row: dict) -> dict:
         **dates,
         "designWorkPath": design_work_path,
         "detailWorkPath": detail_work_path,
-        "localWorkPath": detail_work_path or design_work_path or legacy_local,
+        "localWorkPath": resolve_display_local_work_path(
+            design_work_path, detail_work_path, legacy_local, natures
+        ),
+        "structureType": (row.get("structure_type") or "").strip(),
+        "estimatedWeightTons": row.get("estimated_weight_tons"),
         "contactFormIds": contact_form_ids,
+        "hasUrgentContact": urgent_map.get(project_no, False),
         "relatedProjects": _build_contact_links(project_no, contact_form_ids),
         "detailWorkflow": _map_detail_workflow_with_audit(
             detail_workflow_service.get_detail_workflow(project_no)
         ),
-        "designWorkflow": design_workflow_service.map_design_workflow(
+        "designWorkflow": _map_design_workflow_with_audit(
             design_workflow_service.get_design_workflow(project_no)
         ),
     }
@@ -313,8 +463,10 @@ def _get_personnel_map(project_nos: list[str]) -> dict[str, list[dict]]:
     return result
 
 
-def _get_contact_info_map(project_nos: list[str]) -> tuple[dict[str, list[str]], dict[str, bool]]:
-    """一次查询返回 contact_ids 和 jiagongdan 两个 map（合并同表 JOIN）。"""
+def _get_contact_ids_map(
+    project_nos: list[str],
+) -> tuple[dict[str, list[str]], dict[str, bool]]:
+    """批量取关联联系单号，并标记是否含紧急联系单（仅 JOIN urgency，不扫 content）。"""
     if not project_nos:
         return {}, {}
     placeholders = ", ".join(f":p{i}" for i in range(len(project_nos)))
@@ -322,9 +474,10 @@ def _get_contact_info_map(project_nos: list[str]) -> tuple[dict[str, list[str]],
     rows = db.session.execute(
         text(
             f"""
-            SELECT cfp.project_no, cfp.contact_form_id, cf.id, cf.title, cf.content
+            SELECT cfp.project_no, cfp.contact_form_id, cf.urgency
             FROM contact_form_projects cfp
-            INNER JOIN contact_forms cf ON cf.id = cfp.contact_form_id
+            INNER JOIN contact_forms cf
+              ON cf.id = cfp.contact_form_id AND cf.deleted_at IS NULL
             WHERE cfp.project_no IN ({placeholders})
             ORDER BY cfp.project_no, cfp.contact_form_id
             """
@@ -332,24 +485,15 @@ def _get_contact_info_map(project_nos: list[str]) -> tuple[dict[str, list[str]],
         params,
     ).all()
     contact_map: dict[str, list[str]] = {}
-    jiagongdan_seen: set[str] = set()
-    jiagongdan_map: dict[str, bool] = {}
+    urgent_map: dict[str, bool] = {}
     for row in rows:
-        pno = row.project_no
         cid = (row.contact_form_id or "").strip()
-        contact_map.setdefault(pno, []).append(cid)
-        if pno not in jiagongdan_seen:
-            cid_full = (row.id or "").strip()
-            title = (row.title or "").strip()
-            content = (row.content or "").strip()
-            if (
-                _is_jiagongdan_contact_id(cid_full)
-                or "加工单" in title
-                or re.search(JIAGONGDAN_CONTENT_PATTERN, content)
-            ):
-                jiagongdan_map[pno] = True
-                jiagongdan_seen.add(pno)
-    return contact_map, jiagongdan_map
+        if not cid:
+            continue
+        contact_map.setdefault(row.project_no, []).append(cid)
+        if (row.urgency or "").strip() == "紧急":
+            urgent_map[row.project_no] = True
+    return contact_map, urgent_map
 
 
 def map_projects_batch(rows: list[dict]) -> list[dict]:
@@ -357,15 +501,9 @@ def map_projects_batch(rows: list[dict]) -> list[dict]:
     natures_map = _get_natures_map(project_nos)
     tags_map = tag_service.get_project_tags_map(project_nos)
     personnel_map = _get_personnel_map(project_nos)
-    contact_map, jiagongdan_map = _get_contact_info_map(project_nos)
+    contact_map, urgent_map = _get_contact_ids_map(project_nos)
     workflows_map = detail_workflow_service.get_workflows_orm_map(project_nos)
     design_workflows_map = design_workflow_service.get_workflows_orm_map(project_nos)
-    model_weight_updated_by_ids = [
-        workflow.model_weight_updated_by
-        for workflow in workflows_map.values()
-        if workflow and workflow.model_weight_updated_by
-    ]
-    model_weight_updater_names = _get_personnel_names_by_ids(model_weight_updated_by_ids)
     result = []
     for row in rows:
         assigned = personnel_map.get(row["project_no"], [])
@@ -375,13 +513,19 @@ def map_projects_batch(rows: list[dict]) -> list[dict]:
         legacy_local = normalize_relative_path(row.get("local_work_path") or "")
         project_no = row["project_no"]
         contact_form_ids = contact_map.get(project_no, [])
+        project_natures = natures_map.get(project_no, [])
+        received_date = (
+            (row.get("derived_received_date") or "").strip()
+            or (row.get("received_date") or "").strip()
+            or dates["plannedStartDate"]
+        )
         result.append(
             {
                 "projectNo": project_no,
                 "baseProjectNo": project_no,
                 "name": row["name"],
                 "customer": row.get("customer") or "",
-                "isJiagongdan": jiagongdan_map.get(row["project_no"], False),
+                "isJiagongdan": normalize_completion_flag(row.get("is_jiagongdan")),
                 "status": row["status"],
                 "designCompleted": normalize_completion_flag(row.get("design_completed")),
                 "detailCompleted": normalize_completion_flag(row.get("detail_completed")),
@@ -389,24 +533,24 @@ def map_projects_batch(rows: list[dict]) -> list[dict]:
                 "floorDeckLayoutCompleted": normalize_completion_flag(row.get("floor_deck_layout_completed")),
                 "drawingIssueEnabled": normalize_completion_flag(row.get("drawing_issue_enabled")),
                 "drawingIssueYearMonth": (row.get("drawing_issue_year_month") or "").strip(),
-                "natures": natures_map.get(row["project_no"], []),
+                "natures": project_natures,
                 "tags": tags_map.get(row["project_no"], []),
                 "assignedPersonnelIds": [item["id"] for item in assigned],
                 "assignedPersonnel": assigned,
-                "receivedDate": resolve_received_date(row),
+                "receivedDate": received_date,
                 **dates,
                 "designWorkPath": design_work_path,
                 "detailWorkPath": detail_work_path,
-                "localWorkPath": detail_work_path or design_work_path or legacy_local,
+                "localWorkPath": resolve_display_local_work_path(
+                    design_work_path, detail_work_path, legacy_local, project_natures
+                ),
+                "structureType": (row.get("structure_type") or "").strip(),
+                "estimatedWeightTons": row.get("estimated_weight_tons"),
                 "contactFormIds": contact_form_ids,
+                "hasUrgentContact": urgent_map.get(project_no, False),
                 "relatedProjects": _build_contact_links(project_no, contact_form_ids),
                 "detailWorkflow": detail_workflow_service.map_detail_workflow(
-                    workflows_map.get(project_no),
-                    updated_by_name=model_weight_updater_names.get(
-                        workflows_map[project_no].model_weight_updated_by, ""
-                    )
-                    if workflows_map.get(project_no) and workflows_map[project_no].model_weight_updated_by
-                    else "",
+                    workflows_map.get(project_no)
                 ),
                 "designWorkflow": design_workflow_service.map_design_workflow(
                     design_workflows_map.get(project_no)
@@ -645,6 +789,35 @@ def build_work_paths(payload: dict, existing: dict | None = None) -> tuple[str, 
     return design_work_path, detail_work_path, local_work_path
 
 
+def reconcile_work_paths_for_natures(
+    natures: list[str],
+    design_work_path: str,
+    detail_work_path: str,
+    legacy_local: str = "",
+) -> tuple[str, str, str]:
+    if "design" not in natures:
+        design_work_path = ""
+    if not set(natures) & DETAIL_GROUP_NATURES:
+        detail_work_path = ""
+    local_work_path = detail_work_path or design_work_path
+    if not local_work_path and not natures:
+        local_work_path = legacy_local
+    return design_work_path, detail_work_path, local_work_path
+
+
+def resolve_display_local_work_path(
+    design_work_path: str,
+    detail_work_path: str,
+    legacy_local: str,
+    natures: list[str],
+) -> str:
+    if set(natures) & DETAIL_GROUP_NATURES:
+        return detail_work_path
+    if "design" in natures:
+        return design_work_path
+    return legacy_local
+
+
 def sync_project_natures(project_no: str, natures: list[str]) -> None:
     db.session.execute(
         text("DELETE FROM project_natures WHERE project_no = :project_no"),
@@ -715,7 +888,7 @@ def list_projects(
 
     if load_all:
         rows = db.session.execute(
-            text(f"SELECT p.* FROM projects p {where_clause} ORDER BY {PROJECT_LIST_ORDER}"),
+            text(f"SELECT {PROJECT_LIST_COLUMNS} FROM projects p {where_clause} ORDER BY {PROJECT_LIST_ORDER}"),
             params,
         ).all()
         items = map_projects_batch([_row_to_dict(row) for row in rows])
@@ -740,7 +913,10 @@ def list_projects(
     )
 
     rows = db.session.execute(
-        text(f"SELECT p.* FROM projects p {where_clause} ORDER BY {PROJECT_LIST_ORDER} LIMIT :limit OFFSET :offset"),
+        text(
+            f"SELECT {PROJECT_LIST_COLUMNS} FROM projects p {where_clause} "
+            f"ORDER BY {PROJECT_LIST_ORDER} LIMIT :limit OFFSET :offset"
+        ),
         {**params, "limit": window.limit, "offset": window.offset},
     ).all()
 
@@ -798,7 +974,7 @@ def check_project_nos(project_nos: list[str]) -> dict:
 
 
 def _relink_contact_to_project(contact_form_id: str, project_no: str) -> None:
-    project_no = resolve_project_no(project_no)
+    project_no = ensure_project_for_contact_link(project_no)
     contact_form_id = (contact_form_id or "").strip()
     if not project_no or not contact_form_id:
         return
@@ -809,8 +985,8 @@ def _relink_contact_to_project(contact_form_id: str, project_no: str) -> None:
     )
     db.session.execute(
         text(
-	            insert_ignore("contact_form_projects", "contact_form_id, project_no")
-	            + " VALUES (:contact_form_id, :project_no)"
+            insert_ignore("contact_form_projects", "contact_form_id, project_no")
+            + " VALUES (:contact_form_id, :project_no)"
         ),
         {"contact_form_id": contact_form_id, "project_no": project_no},
     )
@@ -870,6 +1046,7 @@ def sync_project_contact_forms(project_no: str, contact_form_ids: list[str]) -> 
         )
 
     recompute_derived_received_date(project_no)
+    recompute_project_is_jiagongdan(project_no)
     return None
 
 
@@ -1005,7 +1182,9 @@ def _clone_project_from(
         floor_deck_layout_completed=source.floor_deck_layout_completed,
         drawing_issue_enabled=source.drawing_issue_enabled,
         drawing_issue_year_month=source.drawing_issue_year_month,
+        is_jiagongdan=source.is_jiagongdan if copy_contacts else False,
         received_date=source.received_date,
+        derived_received_date=source.derived_received_date if copy_contacts else source.received_date,
         planned_start_date=source.planned_start_date,
         planned_end_date=source.planned_end_date,
         actual_start_date="" if clear_actual_dates else source.actual_start_date,
@@ -1013,6 +1192,8 @@ def _clone_project_from(
         design_work_path=source.design_work_path,
         detail_work_path=source.detail_work_path,
         local_work_path=source.local_work_path,
+        structure_type=source.structure_type,
+        estimated_weight_tons=source.estimated_weight_tons,
         created_at=now_text,
         updated_at=now_text,
     )
@@ -1097,6 +1278,9 @@ def _clone_project_from(
                 project_no=target_no,
                 design_started_at=design_workflow.design_started_at,
                 design_completed_at=design_workflow.design_completed_at,
+                design_area_sqm=design_workflow.design_area_sqm,
+                design_area_updated_at=design_workflow.design_area_updated_at,
+                design_area_updated_by=design_workflow.design_area_updated_by,
                 created_at=now_text,
                 updated_at=now_text,
             )
@@ -1174,6 +1358,8 @@ def copy_project(source_no: str, payload: dict) -> tuple[dict | None, str | None
             "localWorkPath",
             "drawingIssueEnabled",
             "drawingIssueYearMonth",
+            "structureType",
+            "estimatedWeightTons",
         )
         if key in payload
     }
@@ -1185,6 +1371,8 @@ def copy_project(source_no: str, payload: dict) -> tuple[dict | None, str | None
         return result, None, 201
 
     db.session.commit()
+    recompute_derived_received_date(target_no)
+    recompute_project_is_jiagongdan(target_no)
     row = _get_project_row(target_no)
     return map_project(_row_to_dict(row)), None, 201
 
@@ -1269,6 +1457,15 @@ def create_project(payload: dict) -> tuple[dict | None, str | None, int]:
         if year_month_error:
             return None, year_month_error, 400
 
+    structure_type, structure_error = normalize_structure_type(payload.get("structureType"))
+    if structure_error:
+        return None, structure_error, 400
+    estimated_weight_tons, weight_error = normalize_estimated_weight_tons(
+        payload.get("estimatedWeightTons")
+    )
+    if weight_error:
+        return None, weight_error, 400
+
     project = Project(
         project_no=project_no,
         name=name,
@@ -1286,6 +1483,8 @@ def create_project(payload: dict) -> tuple[dict | None, str | None, int]:
         design_work_path=design_work_path,
         detail_work_path=detail_work_path,
         local_work_path=local_work_path,
+        structure_type=structure_type or None,
+        estimated_weight_tons=estimated_weight_tons,
     )
     db.session.add(project)
     sync_project_natures(project_no, natures or [])
@@ -1311,6 +1510,7 @@ def create_project(payload: dict) -> tuple[dict | None, str | None, int]:
 
     db.session.commit()
     recompute_derived_received_date(project_no)
+    recompute_project_is_jiagongdan(project_no)
     row = Project.query.get(project_no)
     return map_project(_row_to_dict(row)), None, 201
 
@@ -1332,10 +1532,11 @@ def update_project(project_no: str, payload: dict) -> tuple[dict | None, str | N
     if nature_error:
         return None, nature_error, 400
 
-    default_assignees = [item["id"] for item in get_assigned_personnel(project_no)]
-    assignee_ids, assignee_error = normalize_assigned_personnel_ids(
-        payload.get("assignedPersonnelIds") or default_assignees
-    )
+    if "assignedPersonnelIds" in payload:
+        raw_assignee_ids = payload.get("assignedPersonnelIds") or []
+    else:
+        raw_assignee_ids = [item["id"] for item in get_assigned_personnel(project_no)]
+    assignee_ids, assignee_error = normalize_assigned_personnel_ids(raw_assignee_ids)
     if assignee_error:
         return None, assignee_error, 400
 
@@ -1376,6 +1577,13 @@ def update_project(project_no: str, payload: dict) -> tuple[dict | None, str | N
         else existing_dates["actualEndDate"]
     )
     design_work_path, detail_work_path, local_work_path = build_work_paths(payload, existing)
+    if "natures" in payload:
+        design_work_path, detail_work_path, local_work_path = reconcile_work_paths_for_natures(
+            natures or [],
+            design_work_path,
+            detail_work_path,
+            local_work_path,
+        )
     project.design_work_path = design_work_path
     project.detail_work_path = detail_work_path
     project.local_work_path = local_work_path
@@ -1397,8 +1605,16 @@ def update_project(project_no: str, payload: dict) -> tuple[dict | None, str | N
     workflow = detail_workflow_service.ensure_detail_workflow(project_no, natures or [])
     design_workflow_service.ensure_design_workflow(project_no, natures or [])
     design_completed, detail_completed = build_completion_flags(payload, natures or [], existing, workflow)
+    previous_design_completed = normalize_completion_flag((existing or {}).get("design_completed"))
     project.design_completed = design_completed
     project.detail_completed = detail_completed
+    if "design" in (natures or []) and design_completed != previous_design_completed:
+        design_workflow = design_workflow_service.ensure_design_workflow(project_no, natures or [])
+        if design_workflow is not None:
+            if design_completed:
+                design_workflow_service.mark_design_completed(design_workflow)
+            else:
+                design_workflow_service.clear_design_completed(design_workflow)
     project.tile_layout_completed = normalize_completion_flag(
         payload.get("tileLayoutCompleted"), default=normalize_completion_flag((existing or {}).get("tile_layout_completed"))
     )
@@ -1433,6 +1649,19 @@ def update_project(project_no: str, payload: dict) -> tuple[dict | None, str | N
                 return None, year_month_error, 400
             project.drawing_issue_year_month = drawing_issue_year_month
 
+    if "structureType" in payload:
+        structure_type, structure_error = normalize_structure_type(payload.get("structureType"))
+        if structure_error:
+            return None, structure_error, 400
+        project.structure_type = structure_type or None
+    if "estimatedWeightTons" in payload:
+        estimated_weight_tons, weight_error = normalize_estimated_weight_tons(
+            payload.get("estimatedWeightTons")
+        )
+        if weight_error:
+            return None, weight_error, 400
+        project.estimated_weight_tons = estimated_weight_tons
+
     target_project_no = project_no
     if "projectNo" in payload:
         raw_new_no = (payload.get("projectNo") or "").strip()
@@ -1451,6 +1680,7 @@ def update_project(project_no: str, payload: dict) -> tuple[dict | None, str | N
 
     db.session.commit()
     recompute_derived_received_date(target_project_no)
+    recompute_project_is_jiagongdan(target_project_no)
 
     updated = Project.query.get(target_project_no)
     return map_project(_row_to_dict(updated)), None, 200
@@ -1546,7 +1776,17 @@ def _sync_project_process_status_from_completion(
     natures: list[str],
     workflow: ProjectDetailWorkflow | None = None,
 ) -> None:
-    """仅设计或仅细化项目：主任务完成时自动将流程状态置为已完成。"""
+    """仅设计或仅细化项目：主任务完成时自动将流程状态置为已完成。
+
+    已取消 / 已暂停 / 未开始 不参与自动流转，允许在这些状态下继续改设计或细化进度。
+    """
+    if project.status in {
+        PROJECT_STATUS_CANCELLED,
+        PROJECT_STATUS_PAUSED,
+        PROJECT_STATUS_NOT_STARTED,
+    }:
+        return
+
     sync_kind = _completion_sync_kind(natures)
     if sync_kind is None:
         return
@@ -1658,6 +1898,24 @@ def save_model_weight(project_no: str, payload: dict) -> tuple[dict | None, str 
     project = Project.query.get(project_no)
     assert project is not None
     _sync_project_after_workflow_change(project, natures, workflow)
+
+    db.session.commit()
+
+    updated = Project.query.get(project_no)
+    return map_project(_row_to_dict(updated)), None, 200
+
+
+def save_design_area(project_no: str, payload: dict) -> tuple[dict | None, str | None, int]:
+    row = Project.query.get(project_no)
+    if row is None:
+        return None, "项目不存在", 404
+
+    natures = get_project_natures(project_no)
+    _, error = design_workflow_service.update_design_area_from_request(
+        project_no, payload, natures
+    )
+    if error:
+        return None, error, 400
 
     db.session.commit()
 

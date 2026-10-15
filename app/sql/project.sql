@@ -28,7 +28,7 @@ SELECT cfp.contact_form_id
 FROM contact_form_projects cfp
 INNER JOIN contact_forms cf ON cf.id = cfp.contact_form_id AND cf.deleted_at IS NULL
 WHERE cfp.project_no = :project_no
-ORDER BY cfp.contact_form_id
+ORDER BY COALESCE(cf.root_id, cf.id), cf.sort_order, cf.id
 
 -- name: get_assigned_personnel
 -- params: project_no

@@ -19,3 +19,9 @@ venv/
 /datas/files/path_template
 /tests
 /datas/files
+
+# db 包本地 SQLite 与导出产物
+/db/datas/*.db
+/db/datas/*.db.*
+/db/datas/exports/
+/scripts/reports/

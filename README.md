@@ -69,7 +69,7 @@ python run.py
 
 ### 方式一：SQLite（推荐，开箱即用）
 
-默认使用容器内 SQLite，数据库文件位于 `itss-steeltech-db/datas/steeltech.db`，数据持久化在 Docker 卷 `steeltech-sqlite-data` 中。首次启动会自动建表并写入种子数据。
+默认使用容器内 SQLite，数据库文件位于 `db/datas/steeltech.db`，数据持久化在 Docker 卷 `steeltech-sqlite-data` 中。首次启动会自动建表并写入种子数据。
 
 ```powershell
 cd itss-steeltech-back
