@@ -241,6 +241,104 @@ def _grant_new_permissions_to_admin(permission_ids: list[str], now: str) -> None
         )
 
 
+def migrate_permission_view_all_constraint() -> None:
+    """重建 permissions 表 CHECK，使 action 支持 view-all。"""
+    bind = db.session.get_bind()
+    if bind.dialect.name != "sqlite":
+        return
+
+    ddl = db.session.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'permissions'")
+    ).scalar()
+    if not ddl or "view-all" in ddl:
+        return
+
+    rows = [
+        dict(row)
+        for row in db.session.execute(text("SELECT * FROM permissions")).mappings().all()
+    ]
+    role_links = [
+        dict(row)
+        for row in db.session.execute(text("SELECT * FROM role_permissions")).mappings().all()
+    ]
+    valid_perm_ids = {row["id"] for row in rows}
+
+    insert_perm = text(
+        """
+        INSERT INTO permissions_new (
+          id, code, name, module, path, page_key, page_name, action, created_at
+        ) VALUES (
+          :id, :code, :name, :module, :path, :page_key, :page_name, :action, :created_at
+        )
+        """
+    )
+    insert_link = text(
+        """
+        INSERT INTO role_permissions_new (role_id, permission_id, created_at)
+        VALUES (:role_id, :permission_id, :created_at)
+        """
+    )
+
+    db.session.execute(text("PRAGMA foreign_keys = OFF"))
+    db.session.execute(text("DROP TABLE IF EXISTS permissions_new"))
+    db.session.execute(text("DROP TABLE IF EXISTS role_permissions_new"))
+    db.session.execute(
+        text(
+            """
+            CREATE TABLE permissions_new (
+              id          TEXT PRIMARY KEY,
+              code        TEXT NOT NULL UNIQUE,
+              name        TEXT NOT NULL,
+              module      TEXT NOT NULL,
+              path        TEXT NOT NULL,
+              page_key    TEXT NOT NULL,
+              page_name   TEXT NOT NULL,
+              action      TEXT NOT NULL,
+              created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+              CHECK (action IN ('view', 'edit', 'view-all'))
+            )
+            """
+        )
+    )
+    for row in rows:
+        db.session.execute(insert_perm, row)
+
+    db.session.execute(text("DROP TABLE permissions"))
+    db.session.execute(text("ALTER TABLE permissions_new RENAME TO permissions"))
+    _ensure_index("permissions", "idx_permissions_module", "module")
+
+    db.session.execute(
+        text(
+            """
+            CREATE TABLE role_permissions_new (
+              role_id       TEXT NOT NULL,
+              permission_id TEXT NOT NULL,
+              created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+              PRIMARY KEY (role_id, permission_id),
+              FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE CASCADE,
+              FOREIGN KEY (permission_id) REFERENCES permissions (id) ON DELETE CASCADE
+            )
+            """
+        )
+    )
+    seen_links: set[tuple[str, str]] = set()
+    for link in role_links:
+        perm_id = link["permission_id"]
+        if perm_id not in valid_perm_ids:
+            continue
+        key = (link["role_id"], perm_id)
+        if key in seen_links:
+            continue
+        seen_links.add(key)
+        db.session.execute(insert_link, link)
+
+    db.session.execute(text("DROP TABLE role_permissions"))
+    db.session.execute(text("ALTER TABLE role_permissions_new RENAME TO role_permissions"))
+    _ensure_index("role_permissions", "idx_role_permissions_role_id", "role_id")
+    db.session.execute(text("PRAGMA foreign_keys = ON"))
+    db.session.commit()
+
+
 def migrate_permission_action_constraint() -> None:
     """重建 permissions 表，使 action 支持 view/edit，并合并旧版 create/update/delete。"""
     bind = db.session.get_bind()
@@ -347,7 +445,7 @@ def migrate_permission_action_constraint() -> None:
               page_name   TEXT NOT NULL,
               action      TEXT NOT NULL,
               created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-              CHECK (action IN ('view', 'edit'))
+              CHECK (action IN ('view', 'edit', 'view-all'))
             )
             """
         )
@@ -3254,6 +3352,7 @@ def ensure_schema(app: Flask) -> None:
         migrate_dedupe_processing_contacts()
         migrate_orphan_contact_projects()
     migrate_permission_action_constraint()
+    migrate_permission_view_all_constraint()
     migrate_dev_team_workshop()
     sync_permission_catalog()
     ensure_system_settings()

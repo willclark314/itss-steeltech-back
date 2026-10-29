@@ -8,7 +8,7 @@ from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
 
 from app.services import leave_service
-from app.services.auth_scope import is_jwt_admin
+from app.services.auth_scope import can_view_all_leave, is_jwt_admin
 from app.utils.route_permissions import register_any_permission_guard
 
 leave_bp = Blueprint("leave", __name__)
@@ -31,7 +31,14 @@ def _check_is_admin() -> bool:
 
 
 def _viewer_context() -> tuple[Optional[str], bool]:
+    """返回 (personnel_id, is_admin)。写操作仍按管理员判定。"""
     return _get_personnel_id_from_token(), _check_is_admin()
+
+
+def _viewer_read_context() -> tuple[Optional[str], bool]:
+    """返回 (personnel_id, can_view_all)。读操作：管理员或 leave:view-all。"""
+    personnel_id = _get_personnel_id_from_token()
+    return personnel_id, can_view_all_leave(personnel_id)
 
 
 # ════════════════════════════════════════════
@@ -42,11 +49,11 @@ def _viewer_context() -> tuple[Optional[str], bool]:
 @leave_bp.get("/policies")
 @jwt_required()
 def list_policies():
-    viewer_personnel_id, viewer_is_admin = _viewer_context()
+    viewer_personnel_id, can_view_all = _viewer_read_context()
     return jsonify(
         leave_service.list_policies(
             viewer_personnel_id=viewer_personnel_id,
-            viewer_is_admin=viewer_is_admin,
+            viewer_is_admin=can_view_all,
         )
     )
 
@@ -58,8 +65,8 @@ def get_policy(policy_id: str):
     if result is None:
         return jsonify({"message": "策略不存在"}), 404
 
-    viewer_personnel_id, viewer_is_admin = _viewer_context()
-    if not viewer_is_admin and result.get("personnelId") != viewer_personnel_id:
+    viewer_personnel_id, can_view_all = _viewer_read_context()
+    if not can_view_all and result.get("personnelId") != viewer_personnel_id:
         return jsonify({"message": "无权限查看该策略"}), 403
     return jsonify(result)
 
@@ -125,7 +132,7 @@ def list_entries():
     personnel_id = request.args.get("personnelId") or None
     entry_type = request.args.get("type") or None
     status = request.args.get("status") or None
-    viewer_personnel_id, viewer_is_admin = _viewer_context()
+    viewer_personnel_id, can_view_all = _viewer_read_context()
     return jsonify(
         leave_service.list_entries(
             year=year,
@@ -133,7 +140,7 @@ def list_entries():
             entry_type=entry_type,
             status=status,
             viewer_personnel_id=viewer_personnel_id,
-            viewer_is_admin=viewer_is_admin,
+            viewer_is_admin=can_view_all,
         )
     )
 
@@ -145,8 +152,8 @@ def get_entry(entry_id: str):
     if result is None:
         return jsonify({"message": "休假记录不存在"}), 404
 
-    viewer_personnel_id, viewer_is_admin = _viewer_context()
-    if not viewer_is_admin and result.get("personnelId") != viewer_personnel_id:
+    viewer_personnel_id, can_view_all = _viewer_read_context()
+    if not can_view_all and result.get("personnelId") != viewer_personnel_id:
         return jsonify({"message": "无权限查看该记录"}), 403
     return jsonify(result)
 
@@ -219,12 +226,12 @@ def delete_entry(entry_id: str):
 @jwt_required()
 def my_scope():
     """返回当前用户的休假数据可见范围"""
-    from app.services.auth_scope import get_user_scope
+    from app.services.auth_scope import get_leave_scope
 
     personnel_id = _get_personnel_id_from_token()
     if not personnel_id:
         return jsonify({"message": "无法识别当前用户"}), 401
-    return jsonify(get_user_scope(personnel_id))
+    return jsonify(get_leave_scope(personnel_id))
 
 
 # ════════════════════════════════════════════
@@ -238,10 +245,10 @@ def get_my_calendar():
     """普通员工专用：仅返回本人休假日历，无法获取全员数据"""
     year_str = request.args.get("year")
     year = int(year_str) if year_str else None
-    viewer_personnel_id, viewer_is_admin = _viewer_context()
+    viewer_personnel_id, can_view_all = _viewer_read_context()
 
-    if viewer_is_admin:
-        return jsonify({"message": "管理员请使用 /calendar"}), 400
+    if can_view_all:
+        return jsonify({"message": "全员视图请使用 /calendar"}), 400
     if not viewer_personnel_id:
         return jsonify({"message": "无法识别当前用户"}), 401
 
@@ -261,9 +268,9 @@ def get_calendar():
     year_str = request.args.get("year")
     year = int(year_str) if year_str else None
     requested_personnel_id = (request.args.get("personnelId") or "").strip() or None
-    viewer_personnel_id, viewer_is_admin = _viewer_context()
+    viewer_personnel_id, can_view_all = _viewer_read_context()
 
-    if not viewer_is_admin:
+    if not can_view_all:
         if not viewer_personnel_id:
             return jsonify({"message": "无法识别当前用户"}), 401
         if requested_personnel_id and requested_personnel_id != viewer_personnel_id:
@@ -273,6 +280,6 @@ def get_calendar():
         leave_service.get_calendar(
             year=year,
             viewer_personnel_id=viewer_personnel_id,
-            viewer_is_admin=viewer_is_admin,
+            viewer_is_admin=can_view_all,
         )
     )

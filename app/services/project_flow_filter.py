@@ -260,16 +260,22 @@ def build_flow_filter_clause(
 
 
 def build_nature_filter_clause(nature_filters: list[str] | None) -> tuple[str, dict]:
+    """Require the project to include every selected nature (AND logic)."""
     if not nature_filters:
         return "", {}
 
-    placeholders = ", ".join(f":nature_{index}" for index, _ in enumerate(nature_filters))
-    params = {f"nature_{index}": value for index, value in enumerate(nature_filters)}
-    clause = f"""EXISTS (
+    clauses: list[str] = []
+    params: dict = {}
+    for index, value in enumerate(nature_filters):
+        key = f"nature_{index}"
+        params[key] = value
+        clauses.append(
+            f"""EXISTS (
       SELECT 1 FROM project_natures pn
-      WHERE pn.project_no = p.project_no AND pn.nature IN ({placeholders})
+      WHERE pn.project_no = p.project_no AND pn.nature = :{key}
     )"""
-    return clause, params
+        )
+    return f"({' AND '.join(clauses)})", params
 
 
 def build_exclude_project_nos_clause(exclude_project_nos: list[str] | None) -> tuple[str, dict]:

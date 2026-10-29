@@ -6,6 +6,7 @@ from flask_jwt_extended import get_jwt, get_jwt_identity
 
 from steeltech_db.models import Personnel
 
+from app.services.permission_service import personnel_has_permission
 from app.services.role_binding_service import personnel_has_role_code
 
 
@@ -97,4 +98,34 @@ def get_user_scope(personnel_id: str) -> dict:
         "role": "member",
         "editablePersonnelIds": [personnel_id],
         "team": person.team,
+    }
+
+
+def can_view_all_leave(personnel_id: str | None = None) -> bool:
+    """当前用户是否可查看全员年休（管理员或 leave:view-all）。"""
+    if is_jwt_admin():
+        return True
+    if not personnel_id:
+        try:
+            claims = get_jwt()
+        except RuntimeError:
+            return False
+        personnel_id = claims.get("personnel_id")
+    if not personnel_id:
+        return False
+    return personnel_has_permission(str(personnel_id), "leave:view-all")
+
+
+def get_leave_scope(personnel_id: str) -> dict:
+    """
+    年休页可见/可编辑范围。
+    canViewAll：可看全员日历；canEditAll：可改他人年休（仅管理员）。
+    """
+    scope = get_user_scope(personnel_id)
+    is_admin = scope.get("role") == "admin"
+    can_view_all = is_admin or can_view_all_leave(personnel_id)
+    return {
+        **scope,
+        "canViewAll": can_view_all,
+        "canEditAll": is_admin,
     }

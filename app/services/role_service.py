@@ -5,14 +5,20 @@ from steeltech_db.models import Permission, Personnel, Role, RolePermission, Rol
 
 from app.services.personnel_service import DEFAULT_WORKSHOP, WORKSHOP_DEV
 from app.services.role_binding_service import normalize_workshop
-from steeltech_db.permission_catalog import sort_permissions
+from steeltech_db.permission_catalog import ALLOWED_PERMISSION_ACTIONS, sort_permissions
+
+# 角色可配置的权限动作（不含已废弃的 edit）
+CONFIGURABLE_PERMISSION_ACTIONS = frozenset({"view", "view-all"})
 
 
 def get_role_permissions(role_id: str) -> list[dict]:
     rows = (
         db.session.query(Permission)
         .join(RolePermission, RolePermission.permission_id == Permission.id)
-        .filter(RolePermission.role_id == role_id, Permission.action == "view")
+        .filter(
+            RolePermission.role_id == role_id,
+            Permission.action.in_(list(CONFIGURABLE_PERMISSION_ACTIONS)),
+        )
         .all()
     )
     return sort_permissions([row.to_dict() for row in rows])
@@ -70,7 +76,9 @@ def map_role(row: Role) -> dict:
 
 
 def list_permissions() -> list[dict]:
-    rows = Permission.query.filter_by(action="view").all()
+    rows = Permission.query.filter(
+        Permission.action.in_(list(CONFIGURABLE_PERMISSION_ACTIONS))
+    ).all()
     return sort_permissions([row.to_dict() for row in rows])
 
 
@@ -111,15 +119,35 @@ def list_roles(*, keyword: str = "", status: str = "") -> list[dict]:
 
 def normalize_permission_ids(ids: list[str] | None) -> tuple[list[str] | None, str | None]:
     unique = list(dict.fromkeys(item.strip() for item in (ids or []) if item and item.strip()))
-    view_ids: list[str] = []
+    accepted_ids: list[str] = []
+    page_keys_with_view: set[str] = set()
+    page_keys_with_view_all: set[str] = set()
+
     for permission_id in unique:
         permission = Permission.query.get(permission_id)
         if permission is None:
             return None, "权限不存在"
-        if permission.action != "view":
+        if permission.action not in CONFIGURABLE_PERMISSION_ACTIONS:
             continue
-        view_ids.append(permission_id)
-    return view_ids, None
+        if permission.action not in ALLOWED_PERMISSION_ACTIONS:
+            continue
+        accepted_ids.append(permission_id)
+        if permission.action == "view":
+            page_keys_with_view.add(permission.page_key)
+        elif permission.action == "view-all":
+            page_keys_with_view_all.add(permission.page_key)
+
+    # 勾选「查看全员」时自动补上对应页面的查看权限
+    missing_view_pages = page_keys_with_view_all - page_keys_with_view
+    if missing_view_pages:
+        for page_key in missing_view_pages:
+            view_perm = Permission.query.filter_by(page_key=page_key, action="view").first()
+            if view_perm is None:
+                return None, f"页面「{page_key}」缺少查看权限，无法配置查看全员"
+            if view_perm.id not in accepted_ids:
+                accepted_ids.append(view_perm.id)
+
+    return accepted_ids, None
 
 
 def normalize_assigned_personnel_ids(ids: list[str] | None) -> tuple[list[str] | None, str | None]:

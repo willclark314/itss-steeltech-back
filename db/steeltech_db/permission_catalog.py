@@ -2,6 +2,9 @@ from __future__ import annotations
 
 ACTION_LABELS = {
     "view": "查看",
+    "view-all": "查看全员",
+    # 历史兼容：migrate_permission_action_constraint 仍可能写入 edit 行
+    "edit": "编辑",
 }
 
 PAGE_DEFINITIONS = [
@@ -161,7 +164,7 @@ PAGE_DEFINITIONS = [
         "page_name": "年休",
         "module": "人员系统",
         "path": "/personnel/leave",
-        "actions": ["view"],
+        "actions": ["view", "view-all"],
     },
     {
         "page_key": "monthly-rest",
@@ -189,8 +192,9 @@ PAGE_DEFINITIONS = [
 MODULE_ORDER = list(dict.fromkeys(page["module"] for page in PAGE_DEFINITIONS))
 PAGE_ORDER_MAP = {page["page_key"]: index for index, page in enumerate(PAGE_DEFINITIONS)}
 MODULE_ORDER_MAP = {module: index for index, module in enumerate(MODULE_ORDER)}
-ACTION_ORDER = ["view"]
+ACTION_ORDER = ["view", "view-all"]
 LEGACY_WRITE_ACTIONS = frozenset({"create", "update", "delete", "edit"})
+ALLOWED_PERMISSION_ACTIONS = frozenset({"view", "view-all", "edit"})
 
 
 def build_permission_catalog() -> list[dict]:

@@ -45,6 +45,10 @@ def _now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _now_year_month() -> str:
+    return datetime.now().strftime("%Y-%m")
+
+
 def needs_detail_workflow(natures: list[str]) -> bool:
     return "detail" in natures
 
@@ -97,8 +101,8 @@ def map_detail_workflow(
         "plateLayoutStatus": row.plate_layout_status,
         "modelingStartedAt": (row.modeling_started_at or "").strip(),
         "modelingCompletedAt": (row.modeling_completed_at or "").strip(),
-        "drawingStartedAt": (row.drawing_started_at or "").strip(),
-        "drawingCompletedAt": (row.drawing_completed_at or "").strip(),
+        "drawingStartedAt": _normalize_drawing_year_month(row.drawing_started_at) or "",
+        "drawingCompletedAt": _normalize_drawing_year_month(row.drawing_completed_at) or "",
         "plateLayoutStartedAt": (row.plate_layout_started_at or "").strip(),
         "plateLayoutCompletedAt": (row.plate_layout_completed_at or "").strip(),
         "modelWeightTons": row.model_weight_tons,
@@ -201,6 +205,7 @@ def _complete_phase(
 def mark_main_flow_completed(workflow: ProjectDetailWorkflow) -> None:
     """将建模、调图、以及（若启用）钢板排板全部置为已完成。"""
     now = _now_text()
+    drawing_month = _now_year_month()
     _complete_phase(
         workflow,
         status_field="modeling_status",
@@ -213,7 +218,7 @@ def mark_main_flow_completed(workflow: ProjectDetailWorkflow) -> None:
         status_field="drawing_status",
         started_field="drawing_started_at",
         completed_field="drawing_completed_at",
-        now=now,
+        now=drawing_month,
     )
     if has_plate_layout_phase(workflow):
         _complete_phase(
@@ -258,6 +263,7 @@ def apply_workflow_action(project_no: str, action: str, natures: list[str]) -> t
     assert workflow is not None
 
     now = _now_text()
+    drawing_month = _now_year_month()
     has_plate_layout = has_plate_layout_phase(workflow)
 
     if normalized_action == WORKFLOW_ACTION_START_MODELING:
@@ -273,7 +279,7 @@ def apply_workflow_action(project_no: str, action: str, natures: list[str]) -> t
         workflow.modeling_completed_at = now
         if workflow.drawing_status == PHASE_STATUS_NOT_STARTED:
             workflow.drawing_status = PHASE_STATUS_IN_PROGRESS
-            _touch_started(workflow, "drawing_started_at", now)
+            _touch_started(workflow, "drawing_started_at", drawing_month)
 
     elif normalized_action == WORKFLOW_ACTION_RESET_MODELING:
         if workflow.modeling_status != PHASE_STATUS_IN_PROGRESS:
@@ -308,7 +314,7 @@ def apply_workflow_action(project_no: str, action: str, natures: list[str]) -> t
         if workflow.drawing_status != PHASE_STATUS_IN_PROGRESS:
             return None, "调图尚未开始或已完成"
         workflow.drawing_status = PHASE_STATUS_COMPLETED
-        workflow.drawing_completed_at = now
+        workflow.drawing_completed_at = drawing_month
 
     elif normalized_action == WORKFLOW_ACTION_RESET_DRAWING:
         if workflow.modeling_status != PHASE_STATUS_COMPLETED:
@@ -361,6 +367,14 @@ VALID_PLATE_LAYOUT_STATUSES = VALID_PHASE_STATUSES | {PHASE_STATUS_NOT_APPLICABL
 def _normalize_workflow_datetime(value) -> str | None:
     text_value = (value or "").strip()
     return text_value or None
+
+
+def _normalize_drawing_year_month(value) -> str | None:
+    """调图阶段仅精确到年月（YYYY-MM）。"""
+    text_value = (value or "").strip()
+    if not text_value:
+        return None
+    return text_value[:7]
 
 
 def _validate_phase_status(value: str | None, *, field_label: str) -> tuple[str | None, str | None]:
@@ -427,8 +441,8 @@ def update_detail_workflow(project_no: str, payload: dict, natures: list[str]) -
 
     modeling_started_at = _normalize_workflow_datetime(payload.get("modelingStartedAt"))
     modeling_completed_at = _normalize_workflow_datetime(payload.get("modelingCompletedAt"))
-    drawing_started_at = _normalize_workflow_datetime(payload.get("drawingStartedAt"))
-    drawing_completed_at = _normalize_workflow_datetime(payload.get("drawingCompletedAt"))
+    drawing_started_at = _normalize_drawing_year_month(payload.get("drawingStartedAt"))
+    drawing_completed_at = _normalize_drawing_year_month(payload.get("drawingCompletedAt"))
     plate_layout_started_at = _normalize_workflow_datetime(payload.get("plateLayoutStartedAt"))
     plate_layout_completed_at = _normalize_workflow_datetime(payload.get("plateLayoutCompletedAt"))
 
